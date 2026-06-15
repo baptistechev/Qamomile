@@ -39,7 +39,9 @@ class GASConverter(MathematicalProblemConverter):
     def __post_init__(self) -> None:
         """Derive and cache the BINARY model from the parent spin model."""
         self.binary_model = self.spin_model.change_vartype(VarType.BINARY)
-        coeffs = [self.binary_model.constant] + list(self.binary_model.coefficients.values())
+        coeffs = [self.binary_model.constant] + list(
+            self.binary_model.coefficients.values()
+        )
         coeffs = GASConverter._align_precision(coeffs)
         precision_aligned_constant = coeffs[0]
         precision_aligned_coefficients = {
@@ -785,7 +787,7 @@ class GASConverter(MathematicalProblemConverter):
             )
             return qmc.measure(q_input)
 
-        y_circuit =self.effective_model.constant - y
+        y_circuit = self.effective_model.constant - y
 
         return transpiler.transpile(
             measure_hubo_grover_algorithm,
