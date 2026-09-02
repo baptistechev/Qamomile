@@ -17,6 +17,7 @@ from .periodic_shift import (
     PeriodicShiftLCUBlockEncoding,
     periodic_shift_lcu_block_encoding,
 )
+from .product import product_block_encoding
 
 __all__ = [
     "LCUBlockEncoding",
@@ -29,4 +30,5 @@ __all__ = [
     "pauli_lcu_block_encoding",
     "PeriodicShiftLCUBlockEncoding",
     "periodic_shift_lcu_block_encoding",
+    "product_block_encoding",
 ]

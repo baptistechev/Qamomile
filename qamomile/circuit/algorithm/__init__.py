@@ -31,6 +31,7 @@ from .fqaoa import (
     initial_occupations,
     mixer_layer,
 )
+from .finite_ite import finite_ite_block_encoding, finite_ite_state
 from .gas import (
     apply_function_preparation_qubo,
     apply_function_preparation_qubo_dagger,
@@ -110,4 +111,7 @@ __all__ = [
     "function_preparation_qubo_dagger",
     "grover_operator",
     "grover_algorithm",
+    # FinITE
+    "finite_ite_block_encoding",
+    "finite_ite_state",
 ]

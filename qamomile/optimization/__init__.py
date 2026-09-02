@@ -11,7 +11,9 @@ phase gadgets), ``FQAOAConverter`` (``fqaoa.py``, fermionic mixers with
 particle-number constraints), the QRAC converters (``qrao/``),
 ``PCEConverter`` (``pce.py``, Pauli correlation encoding), and
 ``GASConverter`` (``gas.py``, oracle-based Grover Adaptive Search over
-QFT-encoded QUBO/HUBO arithmetic).
+QFT-encoded QUBO/HUBO arithmetic), and ``FinITEConverter``
+(``finite_ite.py``, finite imaginary-time evolution block-encoded by a
+termwise LCU with post-selection).
 
 Layering constraint (inviolable)
 --------------------------------
