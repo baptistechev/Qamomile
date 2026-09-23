@@ -1,14 +1,15 @@
-# -*- coding: utf-8 -*-
 # ---
 # jupyter:
 #   jupytext:
-#     cell_metadata_filter: -all
-#     custom_cell_magics: kql
 #     text_representation:
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.11.2
+#       jupytext_version: 1.19.1
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
 # ---
 
 # %% [markdown]
@@ -21,10 +22,18 @@
 # Grover Adaptive Search (GAS) minimizes a polynomial objective over binary
 # variables by repeatedly asking one question of a Grover oracle — *which $x$
 # satisfy $f(x) < y$?* — and lowering the threshold $y$ whenever a better
-# solution turns up {cite:p}`10.22331/q-2021-04-08-428`.
+# solution is found {cite:p}`10.22331/q-2021-04-08-428`.
 #
 # This page solves an unconstrained **portfolio selection** problem with
 # Qamomile's `GASConverter`.
+#
+# The tutorial is built on the following structure:
+#
+# 1. Formulate the problem with [JijModeling](https://jij-inc-jijmodeling-tutorials-en.readthedocs-hosted.com/en/latest/introduction.html).
+# 2. Create an instance with concrete data.
+# 3. Use `GASConverter` to build the Grover circuit for the current threshold.
+# 4. Sample it, keep the best candidate, and repeat until a stopping criterion
+#    is reached. GAS is a hybrid loop, not a single circuit.
 
 # %%
 # Install the latest Qamomile through pip!
@@ -32,6 +41,7 @@
 
 # %%
 import itertools
+import os
 import random
 from typing import Any
 
@@ -52,17 +62,22 @@ from qamomile.qiskit import QiskitTranspiler
 # %% [markdown]
 # ## Background
 #
-# GAS is a hybrid loop, not a single circuit. The quantum half answers one
-# fixed question at a time, and a classical layer drives the threshold down:
+# Grover search takes an oracle that distinguishes target states by reversing
+# their phase and uses amplitude amplification to raise their measurement
+# probability. That solves a decision problem: a fixed condition says which
+# states qualify, not which one is best.
 #
-# 1. Formulate the problem with [JijModeling](https://jij-inc-jijmodeling-tutorials-en.readthedocs-hosted.com/en/latest/introduction.html).
-# 2. Create an instance with concrete data.
-# 3. Use `GASConverter` to build the Grover circuit for the current threshold.
-# 4. Sample it, keep the best candidate, and repeat until a stopping criterion
-#    is reached.
+# GAS turns it into minimization by changing this condition. It distinguishes
+# the quantum states corresponding to candidates with $f(x) < y$ by reversing
+# their phase and samples candidates. If a candidate has a lower objective
+# value than the current threshold, the classical layer updates $y$ to that
+# value. This process repeats, with the quantum circuit answering one fixed
+# question at a time and the classical layer updating the threshold.
 
 # %% [markdown]
 # ## Problem Settings
+#
+# In this tutorial, we apply GAS to a portfolio selection problem.
 #
 # Given $n$ assets (stocks, bonds, etc.), we decide for each one whether to buy
 # it — a binary choice. We want to maximize returns while minimizing risk. The
@@ -85,14 +100,14 @@ from qamomile.qiskit import QiskitTranspiler
 def portfolio_problem(problem: jm.DecoratedProblem):
     n = problem.Length(description="Number of assets")
     q = problem.Float("q", description="Risk aversion factor")
-    μ = problem.Float("μ", shape=(n,), description="Expected returns vector")
-    Σ = problem.Float("Σ", shape=(n, n), description="Covariance matrix")
+    mu = problem.Float("mu", shape=(n,), description="Expected returns vector")
+    Sigma = problem.Float("Sigma", shape=(n, n), description="Covariance matrix")
 
     x = problem.BinaryVar("x", shape=(n,), description="1 if asset i is selected")
 
     problem += (
-        q * jm.sum(Σ[i, j] * x[i] * x[j] for i in n for j in n)
-        - jm.sum(μ[i] * x[i] for i in n)
+        q * jm.sum(Sigma[i, j] * x[i] * x[j] for i in n for j in n)
+        - jm.sum(mu[i] * x[i] for i in n)
     )
 
 
@@ -114,10 +129,11 @@ portfolio_problem
 # | Asset 9 | 3               | 13         |
 
 # %%
-num_assets = 9
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+num_assets = 3 if docs_test_mode else 9
 q = 1
-μ = np.array([22, 4, 19, 3, 23, 2, 5, 25, 3], dtype=int)
-Σ = np.array([
+mu = np.array([22, 4, 19, 3, 23, 2, 5, 25, 3], dtype=int)
+Sigma = np.array([
     [12, -3,  4,  0, -2,  3,  0,  2, -1],
     [-3, 15,  0,  5,  1, -4,  2,  0,  3],
     [ 4,  0, 10, -6,  3,  2, -1,  4,  0],
@@ -128,10 +144,12 @@ q = 1
     [ 2,  0,  4, -2,  0, -3,  2, 16, -4],
     [-1,  3,  0,  5,  2,  1, -2, -4, 13],
 ], dtype=int)
+mu = mu[:num_assets]
+Sigma = Sigma[:num_assets, :num_assets]
 
-assert μ.shape == (num_assets,)
-assert Σ.shape == (num_assets, num_assets)
-assert np.array_equal(Σ, Σ.T), "the covariance matrix must be symmetric"
+assert mu.shape == (num_assets,)
+assert Sigma.shape == (num_assets, num_assets)
+assert np.array_equal(Sigma, Sigma.T), "the covariance matrix must be symmetric"
 
 # %% [markdown]
 # Evaluating the JijModeling problem with that data yields an OMMX instance.
@@ -140,8 +158,8 @@ assert np.array_equal(Σ, Σ.T), "the covariance matrix must be symmetric"
 instance = portfolio_problem.eval({
     "n": num_assets,
     "q": int(q),
-    "μ": μ.tolist(),
-    "Σ": Σ.tolist(),
+    "mu": mu.tolist(),
+    "Sigma": Sigma.tolist(),
 })
 
 assert len(instance.decision_variables) == num_assets
@@ -152,16 +170,35 @@ assert np.isclose(empty_portfolio, 0.0, atol=1e-9, rtol=0.0)
 # %% [markdown]
 # ## Algorithm
 #
-# Given a reference solution $y$, GAS marks every input whose objective value
-# is lower, i.e. $f(x) < y$. The Grover ansatz is built from three components:
+# GAS starts by setting the threshold $y$ to the objective value of a candidate
+# solution and uses Grover search to find candidates with lower objective values.
+# Candidates obtained from the quantum circuit are evaluated classically, and
+# the threshold is updated whenever a better candidate is found. This process
+# repeats until the stopping condition is met. Here $y$ is a threshold on the
+# objective value, not a candidate solution.
+# GAS reverses the phase of the quantum states corresponding to candidates
+# that satisfy $f(x) < y$, distinguishing them from the other candidates.
+# The Grover ansatz is built from three components:
 #
-# - $A_y$, the preparation operator producing $\sum_x \ket{x, f(x) - y}$, built
-#   from QFT phase encoding. Because the register holds $f(x) - y$ in two's
-#   complement, the marked inputs are exactly those whose Most Significant Bit
-#   (MSB) is $1$.
-# - $O_y$, the marker: a single $Z$ on that MSB.
-# - $D$, the diffusion operator, which amplifies the amplitude of the marked
-#   states. It is a single multi-controlled-$Z$ sandwiched between $X$ layers.
+# - $A_y$, the preparation operator. It associates each input with $f(x) - y$
+#   by building the quantum dictionary state $\sum_x \ket{x, f(x) - y}$.
+#   The circuit implementation uses the QFT-based method given in
+#   {cite:p}`10.22331/q-2021-04-08-428`. Because the register holds $f(x) - y$
+#   in two's complement, candidates satisfying the condition can be identified
+#   by a Most Significant Bit (MSB) of $1$.
+# - $O_y$, the phase oracle. It reverses the phase of candidates satisfying
+#   $f(x) < y$. The MSB indicates whether the encoded value $f(x) - y$ is
+#   negative, so this can be implemented with a single $Z$ gate on that MSB.
+# - $D$, the diffusion operator, which amplifies the amplitude of the states
+#   distinguished by their reversed phase. It is a single multi-controlled-$Z$
+#   sandwiched between $X$ layers.
+#
+# One iteration applies $O_y$, then $A_y^\dagger$, $D$, $A_y$. The phase flip on
+# its own leaves every measurement probability unchanged; the reflection
+# $A_y D A_y^\dagger$ is what converts it into amplitude. Measuring the input
+# register returns a candidate, which the classical layer evaluates. It updates
+# $y$ to the candidate's objective value only if that value is lower than the
+# current threshold.
 #
 # The remaining question is how many times to apply the Grover operator. GAS
 # answers it by sampling the iteration count from a range that grows slowly
@@ -170,9 +207,13 @@ assert np.isclose(empty_portfolio, 0.0, atol=1e-9, rtol=0.0)
 # %% [markdown]
 # ## Implementation
 #
-# `GASConverter` takes an OMMX instance and converts the problem into a
-# QUBO/HUBO in the BINARY domain. Its `transpile()` method builds, for a given
-# transpiler, the Grover circuit used by the adaptive search.
+# Qamomile provides the quantum circuits used in GAS through `GASConverter`.
+# This section introduces its usage and the operations that make up the
+# circuit, then combines them with a classical loop to implement GAS.
+#
+# `GASConverter` takes an OMMX instance and converts it into a problem in
+# QUBO/HUBO form. Its `transpile()` method builds, for a given transpiler,
+# the Grover circuit used by the adaptive search.
 
 # %%
 converter = GASConverter(instance)
@@ -181,7 +222,7 @@ transpiler = QiskitTranspiler()
 assert converter.binary_model.num_bits == num_assets
 
 # %% [markdown]
-# ### Visualizing the Grover circuit
+# ### Implementing the Grover circuit
 #
 # `GASConverter.transpile()` internally builds the sampling qkernel below and
 # feeds it to the transpiler. For visualization we can call
@@ -220,7 +261,7 @@ block = transpiler.to_block(
         "n": converter.binary_model.num_bits,
         # Number of output qubits, as computed by the converter
         "m": output_bits,
-        # Oracle threshold: marks states where f(x) < y
+        # Oracle threshold: distinguish states for f(x) < y by reversing their phase
         "y": 0,
         "linear": converter.binary_model.linear,
         "quad": converter.binary_model.quad,
@@ -271,15 +312,23 @@ diffusion_figure
 # %% [markdown]
 # ### The classical layer
 #
-# The function below is not part of Qamomile: it is the classical outer loop of
-# GAS, using `converter.transpile()` and `converter.decode()` as its quantum
-# primitives. It starts from a random candidate $x$ with $y = f(x)$, samples
-# the Grover circuit, and updates the incumbent whenever a sample is better.
-# The search stops after `max_no_improvement` consecutive rounds without
-# improvement.
+# Qamomile's `GASConverter` provides functionality to construct a Grover circuit
+# for a given threshold and convert measurement results into candidate
+# solutions. However, it does not include the classical logic that controls
+# the overall search: evaluating candidates, updating the threshold, adjusting
+# the number of Grover iterations, and checking the stopping condition.
+# To perform optimization with GAS, you therefore need to implement this logic
+# yourself. The function below is an example of such an implementation.
+#
+# It implements the classical outer loop of GAS, using `converter.transpile()`
+# and `converter.decode()` as its quantum primitives. It starts from a random
+# candidate $x$ with $y = f(x)$, samples the Grover circuit, and updates the
+# incumbent whenever a sample is better. The search stops after
+# `max_no_improvement` consecutive rounds without improvement.
 #
 # - `converter.transpile(transpiler, y=y, num_iterations=num_iterations)` builds
-#   the Grover circuit for the current threshold $y$ and Grover depth.
+#   the Grover circuit for the current threshold $y$ and the specified number
+#   of Grover iterations.
 # - `executable.sample(executor, shots=256)` runs it on the backend. Even for
 #   Grover, multiple shots are needed because NISQ quantum devices are noisy.
 # - `converter.decode(result)` maps the raw bitstring counts back to decision
@@ -376,6 +425,10 @@ def grover_adaptive_search(
 # %% [markdown]
 # ## Result
 #
+# In this section, we run GAS on the portfolio selection problem and verify
+# the result by comparing the resulting objective value with the optimum
+# obtained by brute-force search.
+#
 # `lamb` sets how fast the sampling range for the Grover iteration count grows,
 # and `max_no_improvement` fixes the stopping criterion.
 
@@ -384,7 +437,9 @@ x, y = grover_adaptive_search(
     converter=converter,
     transpiler=transpiler,
     lamb=1.2,
-    max_no_improvement=5,
+    max_no_improvement=2 if docs_test_mode else 5,
+    shots=16 if docs_test_mode else 256,
+    seed=0 if docs_test_mode else 900,
 )
 selected = [i + 1 for i, xi in enumerate(x) if xi == 1]
 print(f"Selected assets: {selected}, objective value: {y}")
@@ -401,9 +456,9 @@ assert np.isclose(
 # %% [markdown]
 # The search stops once the solution has not improved for `max_no_improvement`
 # rounds, which is a heuristic rule — it does not by itself prove that the
-# returned solution is optimal. With only $9$ assets the problem is small enough
-# to enumerate all $2^9 = 512$ assignments, so we can check the answer against
-# an exact brute-force reference instead of asserting optimality on faith.
+# returned solution is optimal. With $9$ assets, we can enumerate all
+# $2^9 = 512$ assignments, so let's verify the result against an exact
+# brute-force reference.
 
 # %%
 brute_force_x, brute_force_y = min(
@@ -429,10 +484,9 @@ print("\nGAS matched the brute-force optimum.")
 #
 # - Solved an unconstrained portfolio problem with Grover Adaptive Search,
 #   where the quantum circuit answers "which $x$ satisfy $f(x) < y$?" and a
-#   classical loop drives $y$ downwards.
-# - Used `GASConverter` for the quantum half: `transpile()` builds the Grover
-#   circuit for the current threshold and depth, and `decode()` maps bitstring
-#   counts back to decision variables through OMMX.
-# - Sized the arithmetic register with `required_output_bits()`, since it must
-#   hold $f(x) - y$ for every $x$, and checked the heuristic's answer against a
-#   brute-force optimum.
+#   classical loop updates the threshold $y$ when a better candidate is found.
+# - Used `GASConverter` for the quantum part of GAS: `transpile()` builds the
+#   Grover circuit for the current threshold and number of Grover iterations,
+#   and `decode()` maps bitstring counts back to decision variables through OMMX.
+# - Ran GAS on a portfolio selection problem and verified that the resulting
+#   objective value matched the optimum obtained by brute-force search.
