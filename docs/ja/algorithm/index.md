@@ -9,9 +9,9 @@ Qamomileで実装した具体的な量子アルゴリズム例です。
 ::::{grid} 1 1 1 1
 
 :::{card}
-:header: **グラフ彩色のためのAlternating Operator Ansatz**
+:header: **グラフ彩色のための量子交互演算子アンザッツ**
 :link: aoa_coloring_problem
-Dicke状態による初期状態とXYミキサーを使い、ワンホットの可行部分空間に留まったままK彩色問題をAlternating Operator Ansatzで解きます。
+Dicke状態による初期状態とXYミキサーを使い、グラフ彩色問題の解を実行可能な解の空間上で探索します。
 :::
 
 :::{card}

@@ -1,18 +1,15 @@
-# -*- coding: utf-8 -*-
 # ---
 # jupyter:
 #   jupytext:
-#     cell_metadata_filter: -all
-#     custom_cell_magics: kql
 #     text_representation:
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.11.2
+#       jupytext_version: 1.18.1
 #   kernelspec:
-#     display_name: qamomile-env
+#     display_name: Python 3
 #     language: python
-#     name: qamomile-env
+#     name: python3
 # ---
 
 # %% [markdown]
@@ -22,40 +19,66 @@
 #
 # # Alternating Operator Ansatz for Graph Coloring
 #
-# This tutorial demonstrates how to solve the **K - graph coloring problem**
-# with Qamomile using the Alternating Operator Ansatz (AOA).
-#
-# >Hadfield, S.; Wang, Z.; O’Gorman, B.; Rieffel, E.G.; Venturelli, D.; Biswas, R. From the Quantum Approximate Optimization Algorithm to a Quantum Alternating Operator Ansatz. Algorithms 2019, 12, 34. https://doi.org/10.3390/a12020034
-#
-# The AOA algorithm extends QAOA by using more general mixers and initial states.
-#
-# ### Why does this matter for graph coloring?
-# The one-hot encoding uses $N \times K$ binary variables but only $K^N$
-# of the $2^{NK}$ bitstrings are feasible (one color per node).
-# On the 5-node, 3-color instance below, that is 243 feasible states inside
-# a $2^{15} = 32768$-dimensional Hilbert space, i.e. less than $1\%$.
-# Standard QAOA starts in a uniform superposition over the full space and uses a transverse-field mixer
-# ($\sum X_i$) that freely rotates qubits in and out of the feasible subspace,
-# so most of the sampled bitstrings violate the one-hot constraint and get discarded.
-# AOA fixes both ends: it starts inside the feasible subspace and uses an XY mixer that
-# preserves Hamming weight, so every sample is feasible by construction.
+# This tutorial demonstrates how to solve the graph coloring problem with
+# Qamomile using the Alternating Operator Ansatz (AOA). The AOA formulation
+# used here follows Hadfield *et al.* {cite:p}`10.3390/a12020034`.
 #
 # We will proceed as follows:
 #
-# 1. Formulate the problem with [JijModeling](https://jij-inc-jijmodeling-tutorials-en.readthedocs-hosted.com/en/latest/introduction.html).
-# 2. Create an instance with concrete data.
-# 3. Use `AOAConverter` to build the AOA circuit with designated mixer and initial state.
-# 4. Optimize the variational parameters with a classical optimizer.
-# 5. Sample the optimized circuit and decode the results. We will highlight the feasibility advantage over QAOA
+# 1. Formulate the problem with [JijModeling](https://jij-inc-jijmodeling-tutorials-en.readthedocs-hosted.com/en/latest/introduction.html) and create an instance with concrete data.
+# 2. Use `AOAConverter` to build the AOA circuit with a chosen mixer and initial state.
+# 3. Optimize the variational parameters with a classical optimizer.
+# 4. Sample the optimized circuit, decode the results, and check that every sample is feasible.
 
 # %%
 # Install the latest Qamomile through pip!
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit]"
+
+# %%
+import os
+
+import jijmodeling as jm
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import ommx.v1
+from qiskit_aer import AerSimulator
+from scipy.optimize import minimize
+
+import qamomile.circuit as qmc
+from qamomile.circuit.algorithm.aoa import xy_mixer
+from qamomile.circuit.algorithm.qaoa import ising_cost
+from qamomile.circuit.stdlib.state_preparation import prepare_dicke
+from qamomile.optimization.aoa import AOAConverter
+from qamomile.qiskit import QiskitTranspiler
 
 # %% [markdown]
-# ## Problem Formulation
+# ## Background
 #
-# Given an undirected graph $G = (V, E)$, the goal is to find a coloring of $G$ using a given number $K$ of colors such that the number of adjacent vertex of $G$ having the same color is minimal.
+# AOA extends the QAOA circuit by using more general mixer Hamiltonians and
+# initial states. This is useful for constrained problems such as graph
+# coloring.
+#
+# With the one-hot encoding used below, graph coloring needs $N \times K$
+# binary variables, but only $K^N$ of the $2^{NK}$ bitstrings are feasible (one
+# color per node). On the 5-node, 3-color instance below, that is 243 feasible
+# states inside a $2^{15} = 32768$-dimensional Hilbert space, i.e. less than
+# $1\%$. Standard QAOA starts in a uniform superposition over the full space and
+# uses a transverse-field mixer ($\sum X_i$) that freely rotates qubits in and
+# out of the feasible subspace, so most of the sampled bitstrings violate the
+# one-hot constraint and get discarded.
+#
+# AOA addresses both ends: it starts inside the feasible subspace and uses an XY
+# mixer that only moves amplitude between feasible states, so every sample is
+# feasible by construction.
+
+# %% [markdown]
+# ## Problem Settings
+#
+# Given an undirected graph $G = (V, E)$ and a number $K$ of available colors,
+# the goal is to assign one color to each vertex so that as few edges as
+# possible connect two vertices of the same color. We call such an edge a
+# conflict.
 #
 # **Objective:**
 #
@@ -69,17 +92,13 @@
 # \sum_{i=0}^{K-1} x_{u, i}=1, \forall u \in\{0, \ldots, N-1\}
 # $$
 #
-# where $x_{u, i} \in\{0,1\}$ indicates whether color $i$ is used for vertex $u$ or not.
+# where $x_{u, i} \in\{0,1\}$ indicates whether color $i$ is used for vertex $u$
+# or not. The objective counts the number of conflicts.
 
-# %% [markdown]
-# ## Define the Problem with JijModeling
 
 # %%
-import jijmodeling as jm
-
-
 @jm.Problem.define("Graph Coloring", sense=jm.ProblemSense.MINIMIZE)
-def graph_coloring_decorated(problem : jm.DecoratedProblem):
+def graph_coloring_decorated(problem: jm.DecoratedProblem):
     N = problem.Length()
     K = problem.Natural()
 
@@ -90,22 +109,24 @@ def graph_coloring_decorated(problem : jm.DecoratedProblem):
         description="$x_{i,k}$ is 1 if node $i$ is colored with color $k$, 0 otherwise",
     )
 
-    problem += jm.sum(
-        x[u, i] * x[v, i] for (u, v) in E for i in K
-    )
+    problem += jm.sum(x[u, i] * x[v, i] for (u, v) in E for i in K)
 
     problem += problem.Constraint(
         "ColoringConstraint",
         (jm.sum(x[u, i] for i in K) == 1 for u in N),
-        description="Each node must be colored with exactly one color"
+        description="Each node must be colored with exactly one color",
     )
+
 
 graph_coloring_decorated
 
 # %% [markdown]
 # ### Reading the constraint as a Hamming-weight condition
 #
-# The constraint $\sum_{i=0}^{K-1} x_{u,i} = 1$ says: among the $K$ binary variables attached to node $u$, exactly one is $1$. When we lay these out as a bitstring, each node occupies a *block* of $K$ consecutive qubits, and feasibility means **each block has Hamming weight exactly 1**.
+# The constraint $\sum_{i=0}^{K-1} x_{u,i} = 1$ says that, among the $K$ binary
+# variables attached to node $u$, exactly one is $1$. When we lay these out as a
+# bitstring, each node occupies a block of $K$ consecutive qubits, and
+# feasibility means **each block has Hamming weight exactly 1**.
 #
 # For our 5-node, 3-color instance the qubit layout is:
 #
@@ -114,23 +135,23 @@ graph_coloring_decorated
 #    node 0     node 1     node 2     node 3        node 4
 # ```
 #
-# A feasible state has one `1` in each bracketed block. This block structure is exactly what `block_size` will refer to later: we tell the converter to prepare a Dicke state *inside each block* and to mix *only within each block*, which keeps every block at Hamming weight 1 throughout the circuit.
+# A feasible state has one `1` in each bracketed block.
 
 # %% [markdown]
-# ## Graph Instance
+# ### Graph instance
 #
-# We use a fixed 5-node graph with 6 edges for reproducibility.
+# In this tutorial, we use a fixed 5-node graph with 6 edges.
 
 # %%
-import matplotlib.pyplot as plt
-import networkx as nx
-
 num_nodes = 5
+num_colors = 3
 edge_list = [(0, 2), (0, 3), (0, 4), (1, 3), (2, 4), (3, 4)]
 
 G = nx.Graph()
 G.add_nodes_from(range(num_nodes))
 G.add_edges_from(edge_list)
+assert G.number_of_nodes() == num_nodes
+assert G.number_of_edges() == len(edge_list)
 
 pos = nx.spring_layout(G, seed=1)
 plt.figure(figsize=(5, 5))
@@ -145,72 +166,131 @@ nx.draw(
 plt.title(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 plt.show()
 
-
 # %% [markdown]
-# ## Create the Instance
-#
-# We extract the edge list from the graph and evaluate the JijModeling
-# problem with the concrete data.
+# We evaluate the JijModeling problem with the concrete data to obtain an OMMX
+# instance with $N \times K = 15$ binary variables and one constraint per node.
 
 # %%
-num_colors = 3
 instance_data = {"N": num_nodes, "E": edge_list, "K": num_colors}
 instance = graph_coloring_decorated.eval(instance_data)
 
+assert len(instance.decision_variables) == num_nodes * num_colors
+assert len(instance.constraints) == num_nodes
+
 # %% [markdown]
-# ## Set Up the AOAConverter
+# ## Algorithm
 #
-# `AOAConverter` takes an OMMX instance and internally convert it into a QUBO form and build the Hamiltonian (see QAOA tutorial for more details).
+# Like QAOA, AOA alternates a cost layer and a mixer layer $p$ times, starting
+# from an initial state $\lvert \psi_0 \rangle$:
 #
-# Recall:
-# 1. The energy values from the decoded samples are **not** the original objective, it includes **penalty terms**.
-# 2. We need to re-evaluate the true objective values separately
+# $$
+# \lvert \psi(\boldsymbol{\gamma}, \boldsymbol{\beta}) \rangle
+# = \prod_{l=1}^{p} U_M(\beta_l)\, e^{-i \gamma_l H_C} \lvert \psi_0 \rangle ,
+# $$
+#
+# where $H_C$ is the cost Hamiltonian and $U_M$ is the mixer. AOA differs from
+# QAOA in the choice of $\lvert \psi_0 \rangle$ and $U_M$.
+#
+# **XY mixer.** The mixer is built from pairwise XY interactions
+#
+# $$
+# H_{ij}^{XY}=\frac{1}{2}(X_iX_j+Y_iY_j),
+# \qquad
+# U_{ij}^{XY}(\beta)=e^{-i\beta H_{ij}^{XY}}.
+# $$
+#
+# On two qubits, $H_{ij}^{XY}$ maps $\lvert 01 \rangle \leftrightarrow \lvert 10 \rangle$
+# and sends $\lvert 00 \rangle$ and $\lvert 11 \rangle$ to zero. So $U_{ij}^{XY}(\beta)$
+# mixes the amplitudes of $\lvert 01 \rangle$ and $\lvert 10 \rangle$ without
+# changing the number of ones. Applying it only to pairs of qubits inside the
+# same node's color block therefore preserves the one-hot constraint: the single
+# `1` of each block can move to another color, but it can neither disappear nor
+# be duplicated.
+#
+# **Initial state.** The circuit must also start inside the feasible subspace.
+# A natural choice is a Dicke state in each block: an equal superposition over
+# all bitstrings with the chosen Hamming weight. For Hamming weight 1 and block
+# size $K$, each block is prepared in
+#
+# $$
+# \lvert D^K_1 \rangle = \frac{1}{\sqrt{K}}
+# \left(\lvert 10\ldots 0\rangle + \lvert 01\ldots 0\rangle + \cdots + \lvert 0\ldots 01\rangle\right),
+# $$
+#
+# so the full initial state is a uniform superposition over all feasible
+# colorings.
+#
+# **Cost layer.** The cost layer $e^{-i \gamma H_C}$ is the same as in QAOA. The
+# optimizer then tunes $\boldsymbol{\gamma}$ and $\boldsymbol{\beta}$ to
+# concentrate amplitude on colorings with few conflicts.
+
+# %% [markdown]
+# ## Implementation
+#
+# ### Set up the AOAConverter
+#
+# `AOAConverter` takes an OMMX instance, converts it into QUBO form internally,
+# and builds the cost Hamiltonian, in the same way as the QAOA converter (see
+# [QAOA for Graph Partitioning](qaoa_graph_partition) for the converter
+# workflow). The energy of the decoded samples includes penalty terms, so the
+# true objective is evaluated separately when decoding.
 
 # %%
-from qamomile.optimization.aoa import AOAConverter
-
 converter = AOAConverter(instance)
 converter.spin_model = converter.spin_model.normalize_by_abs_max()
 hamiltonian = converter.get_cost_hamiltonian()
 print(hamiltonian)
 
+assert converter.spin_model.num_bits == num_nodes * num_colors
+
 # %% [markdown]
-# ## Transpile to an Executable Circuit
+# ### Choose the initial state and mixer
 #
-# `converter.transpile()` works exactly as in the QAOA case.
+# `converter.transpile()` works as in the QAOA case, with extra options to
+# select the initial state and the XY mixer.
 #
-# In addition, we can select what kind of XY mixer and initial state we want to use.
+# For the initial state, we can choose between:
 #
-# For initial state, we can choose between:
+# - `single_basis_state`: a single computational-basis state with the right
+#   Hamming weight in each block. The converter sets the last qubit(s) of each
+#   block to $|1\rangle$ (e.g. $|001\rangle|001\rangle\ldots$ in the order
+#   $q_0 q_1 q_2$, meaning every node starts with the last color). This starts from one valid coloring and
+#   requires relatively few gates to prepare. The mixer is responsible for
+#   spreading amplitude to other feasible states.
+# - `dicke`: a Dicke state in each block, as described above. It costs extra
+#   gates to prepare ($O(K)$ gates per block) but gives the optimizer an
+#   unbiased starting point over all feasible colorings.
+# - `uniform`: a Hadamard gate on every qubit, the standard QAOA initial state.
+#   **This puts amplitude on infeasible states**, so the feasibility guarantee
+#   of AOA is lost. It is mainly useful for comparisons of how different
+#   initial states affect the result.
 #
-# - `single_basis_state` : a single computational-basis state with the right Hamming weight in each block (e.g. $|100\rangle|100\rangle\ldots$, meaning every node starts colored with color 0). Feasible, deterministic, cheap to prepare. The mixer is responsible for spreading amplitude to other feasible states. This is the simplest choice and a good first thing to try.
+# The `hamming_weight` parameter sets the target Hamming weight per block. For
+# graph coloring with one-hot encoding it is always `1`. For other problems
+# (e.g. cardinality-constrained optimization where exactly $k$ items must be
+# selected), it would be different.
 #
-# - `dicke` : a Dicke state in each block: an equal superposition over all bitstrings with the chosen Hamming weight. For Hamming weight 1 and block size $K$, this is $\frac{1}{\sqrt{K}}(|10\ldots 0\rangle + |01\ldots 0\rangle + \cdots + |0\ldots 01\rangle)$ in each block, so the full initial state is already a uniform superposition over the *entire feasible space*. Costs extra gates to prepare ($O(K)$ XY rotations per block) but gives the optimizer an unbiased starting point.
+# For the mixer, we can select:
 #
-# - `uniform` : Hadamard on every qubit, the standard QAOA initial state. **This puts amplitude on infeasible states**, so the feasibility guarantee of AOA is lost; samples will need to be filtered like in plain QAOA. Useful mainly as a baseline or for ablations comparing initial states.
+# - `ring`: connects each qubit in a block only to its two neighbors in a
+#   cycle. It is applied as odd pairs, then even pairs, then the wrap-around
+#   pair, so each layer costs $O(K)$ two-qubit gates per block. The circuit is
+#   shallower, but amplitude takes more layers to spread across the block.
+# - `fully-connected`: connects every pair of qubits within a block. The
+#   $\binom{K}{2}$ pairs are split into rounds of non-overlapping pairs, so each
+#   layer costs $O(K^2)$ two-qubit gates per block. The circuit is deeper, but
+#   amplitude mixes across the block in a single layer.
 #
-# The `hamming_weight` parameter sets the target Hamming weight per block. For graph coloring with one-hot encoding it's always `1`. For other problems (e.g. cardinality-constrained optimization where exactly $k$ items must be selected), it would be different.
+# As a rule of thumb, prefer `ring` when $K$ is large and circuit depth is the
+# bottleneck, and `fully-connected` when $K$ is small (say $\leq 4$).
 #
-# For mixer, we can select:
-#
-# - `ring` : connects each qubit in a block only to its two neighbors in a cycle. Implemented via a *parity* decomposition (odd pairs, then even pairs, then the wrap-around), so each layer costs $O(K)$ two-qubit gates per block. Shallower circuit, but amplitude takes more layers to spread across the block.
-#
-# - `fully-connected` : connects every pair of qubits within a block. Implemented via a *partition* decomposition (the $\binom{K}{2}$ pairs are split into non-overlapping rounds), so each layer costs $O(K^2)$ two-qubit gates per block. Deeper circuit, but amplitude mixes across the block in a single layer.
-#
-# Rule of thumb: prefer `ring` when $K$ is large and circuit depth is the bottleneck; prefer `fully-connected` when $K$ is small (say $\leq 4$) and you want faster mixing and more diverse samples. In practice on small instances `fully-connected` tends to produce more distinct feasible solutions per shot.
-#
-# The parameter `block_size` can be a bit difficult to understand.
-# It is used to define the size of each block on which a Dicke state is built and the mixers apply.
-# In our case for the graph coloring problem:
-# - we have $K$ qubits for one node which can take $K$ colors
-# - the constraint states that each node can only take a single color. So within each subset of $K$ qubits, the hamming_weight (number of ones) should remain equal to $1$.
-# - we set `block_size = num_colors` to state: "prepare a Dicke state in each subset of $K$ qubits and mix only within each subset".
-#
-# The behavior is illustrated thoroughly in the next section using the draw function.
+# Finally, `block_size` tells the converter how the register is split into
+# blocks. The Dicke state is prepared inside each block and the mixer only
+# couples qubits of the same block. For graph coloring, each node owns $K$
+# qubits whose Hamming weight must stay equal to $1$, so we set
+# `block_size = num_colors`.
 
 # %%
-from qamomile.qiskit import QiskitTranspiler
-
 transpiler = QiskitTranspiler()
 p = 5  # number of AOA layers
 
@@ -223,14 +303,13 @@ executable_aoa_dicke = converter.transpile(
     block_size=num_colors,
 )
 
+assert executable_aoa_dicke.quantum_circuit.num_qubits == num_nodes * num_colors
+
 # %% [markdown]
-# ## Visualize the AOA Circuit
+# ### Visualize the AOA circuit
 #
-# The `Transpiler.to_block` -> `MatplotlibDrawer.draw` pipeline does not support yet the AOA qkernel.
-#
-# We can use qiskit draw function to visualize the ansatz.
-#
-# For readability we use `p=1`.
+# We draw the transpiled Qiskit circuit, in which the Dicke-state preparation
+# is already resolved into concrete gates. For readability we use `p=1`.
 
 # %%
 executable = converter.transpile(
@@ -246,32 +325,41 @@ fig = executable.quantum_circuit.draw("mpl", fold=-1, scale=2.2)
 fig
 
 # %% [markdown]
-# ### Inspecting the Building Blocks
+# ### Inspect the building blocks
 #
-# Let's take some time to explain this circuit and illustrate the use of `block_size`.
-# `block_size` is set on $K=3$ (the number of color) in this example.
+# Inside `aoa_state_dicke`, the converter calls several qkernels:
 #
-# Inside `aoa_state_dicke`, we call several qkernels:
+# - `prepare_dicke(n, initial_ones, ...)`: the $X$ gates in the first column
+#   create a basis state with the given Hamming weight in each block. A
+#   sequence of $R_Y$ and CNOT gates then builds the Dicke state inside each
+#   block.
+# - `ising_cost(quad, linear, q, gamma)`: the cost layer, the same as in QAOA.
+#   It uses $R_Z$ and $R_{ZZ}$ rotation gates.
+# - `xy_mixer(q, betas[layer], pair_indices_mixer)`: the mixer layer, which
+#   applies $U_{ij}^{XY}$ to every pair of qubits listed in
+#   `pair_indices_mixer`.
 #
-# - `prepare_dicke(n,initial_ones,...)` — on the first column several $X$ gates to create the original basis state with given hamming weight for each block. Then a sequence of $R_Y$ and CNOT gates, is used for building the Dicke state inside each block: superposition of all state of same hamming weight.
+# `aoa_layers(p, ...)` alternates `ising_cost` and `xy_mixer`, repeated `p`
+# times.
 #
-# - `ising_cost(quad, linear, q, gamma)` — the cost layer: same as QAOA. Uses $R_Z$ and $R_ZZ$ rotation gates.
-#
-# - `xy_mixer(q, betas[layer], pair_indices_mixer)` — a bunch of CNOT and $R_X$ gates are applied to each block for the mixer layer.
-#
-# `aoa_layers(p, ...)` is just the alternation of `ising_cost` and
-# `xy_mixer`, repeated `p` times.
+# The converter exposes the Dicke schedule and the mixer pairs it computed from
+# `block_size`. They are useful for drawing the building blocks, but are not
+# needed in the normal workflow.
 
 # %%
-import qamomile.circuit as qmc
-from qamomile.circuit.algorithm.aoa import xy_mixer
-from qamomile.circuit.algorithm.qaoa import ising_cost
-from qamomile.circuit.stdlib.state_preparation import prepare_dicke
+initial_ones, schedule_dicke = converter.compute_dicke_composition_schedule(
+    hamming_weight=1, block_size=num_colors
+)
+resolved_pair = converter.resolve_pair_indices(
+    mixer="fully-connected", pair_indices=None, block_size=num_colors
+)
 
-#We can access the internal logic of the converter to get the indices for dicke state preparation and mixer construction.
-#This is useful for visualizing but not part of the normal user workflow.
-initial_ones, schedule_dicke = converter.compute_dicke_composition_schedule(hamming_weight=1, block_size=num_colors)
-resolved_pair = converter.resolve_pair_indices(mixer="fully-connected", pair_indices=None, block_size=num_colors)
+# One qubit set to |1> per block, and K(K-1)/2 mixer pairs per block.
+assert len(initial_ones) == num_nodes
+assert len(resolved_pair) == num_nodes * num_colors * (num_colors - 1) // 2
+# Every mixer pair couples two qubits of the same block.
+assert all(i // num_colors == j // num_colors for i, j in resolved_pair)
+
 
 @qmc.qkernel
 def prepare_dicke_measure(
@@ -282,7 +370,8 @@ def prepare_dicke_measure(
     q = prepare_dicke(n, initial_ones, schedule)
     return qmc.measure(q)
 
-executable = transpiler.transpile(
+
+executable_dicke = transpiler.transpile(
     prepare_dicke_measure,
     bindings={
         "n": converter.spin_model.num_bits,
@@ -291,7 +380,7 @@ executable = transpiler.transpile(
     },
 )
 
-executable.quantum_circuit.draw("mpl", fold=-1, scale=2.2)
+executable_dicke.quantum_circuit.draw("mpl", fold=-1, scale=2.2)
 
 # %%
 ising_cost.draw(
@@ -302,10 +391,6 @@ ising_cost.draw(
 )
 
 # %%
-#We can access the internal logic of the converter to get the indices for the mixer construction.
-#This is useful for visualizing but not part of the normal user workflow.
-resolved_pair = converter.resolve_pair_indices(mixer="fully-connected", pair_indices=None, block_size=num_colors)
-
 fig = xy_mixer.draw(
     q=converter.spin_model.num_bits,
     pair_indices_mixer=resolved_pair,
@@ -318,33 +403,26 @@ fig.set_size_inches(100, 8)
 fig
 
 # %% [markdown]
-# ## Optimizing the Alternating Operator Ansatz parameters
+# ## Result
+#
+# ### Optimize the AOA parameters
 #
 # We use `executable.sample()` to evaluate the cost at each iteration of the
 # classical optimizer. The optimizer explores different `gammas` and `betas`
 # to minimize the mean energy of the sampled bitstrings.
 
 # %%
-import os
-
-import numpy as np
-from qiskit_aer import AerSimulator
-from scipy.optimize import minimize
-
-# Seed the simulator so re-executing the notebook reproduces the same
-# COBYLA trajectory and final sampling distribution. Without a seed,
-# every shot draws fresh randomness, COBYLA sees a noisy cost surface,
-# and each notebook run converges to a different (but equivalent) local
-# optimum.
 executor = transpiler.executor(
     backend=AerSimulator(seed_simulator=901, max_parallel_threads=1)
 )
 docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
 sample_shots = 256 if docs_test_mode else 2048
 maxiter = 25 if docs_test_mode else 1000
+final_shots = 64 if docs_test_mode else 1000
 
 rng = np.random.default_rng(900)
 initial_params = rng.uniform(0, np.pi, 2 * p)
+assert initial_params.shape == (2 * p,)
 
 cost_history = []
 
@@ -358,12 +436,6 @@ def cost_fn(params):
         bindings={"gammas": gammas, "betas": betas},
     )
     result = job.result()
-    # decode_to_binary_sampleset returns the QUBO-domain BinarySampleSet
-    # whose `energy` is the penalized objective — what COBYLA needs to
-    # see infeasibility costs. The polymorphic decode() returns an
-    # ommx.v1.SampleSet whose `objective` is the un-penalized true
-    # objective; using it here would let the optimizer settle on
-    # infeasible all-zero / all-one bitstrings.
     decoded = converter.decode_to_binary_sampleset(result)
     energy = decoded.energy_mean()
     cost_history.append(energy)
@@ -380,6 +452,8 @@ res = minimize(
 print(f"Optimized cost: {res.fun:.3f}")
 print(f"Optimal params: {[round(v, 4) for v in res.x]}")
 print(f"Function evaluations: {res.nfev}")
+assert len(cost_history) == res.nfev
+assert len(res.x) == 2 * p
 
 # %%
 plt.figure(figsize=(8, 4))
@@ -390,10 +464,10 @@ plt.title("AOA Optimization Progress")
 plt.show()
 
 # %% [markdown]
-# ## Sample with Optimized Parameters
+# ### Sample with the optimized parameters
 #
-# With the optimized parameters, we sample the circuit to collect
-# candidate solutions as bitstrings.
+# With the optimized parameters, we sample the circuit to collect candidate
+# solutions as bitstrings and decode them into an OMMX `SampleSet`.
 
 # %%
 gammas_opt = list(res.x[:p])
@@ -401,29 +475,20 @@ betas_opt = list(res.x[p:])
 
 sample_result = executable_aoa_dicke.sample(
     executor,
-    shots=1000,
+    shots=final_shots,
     bindings={"gammas": gammas_opt, "betas": betas_opt},
 ).result()
 
-# `decode()` on an OMMX-backed converter returns an `ommx.v1.SampleSet`
-# evaluated against the *original* (un-penalized) instance, so
-# feasibility, the true objective, and per-constraint diagnostics are
-# available through OMMX's own API — no hand-rolled feasibility or
-# objective helper is needed.
 sample_set = converter.decode(sample_result)
+assert isinstance(sample_set, ommx.v1.SampleSet)
 
 # %% [markdown]
-# ## Analyze the Results
+# ### Feasibility check
 #
-# ### Feasibility Check
-#
-# We can now check the advantage of AOA compared to QAOA.
-#
-# The problem-tailored XY mixer that we implemented should
-# allow one to remain within the feasible space. Thus,
-# unlike the QAOA case, **candidate solutions** proposed by AOA
-# should all live into the feasible space.
-# That means, they respect the constraint hamming weight $=1$
+# The problem-specific XY mixer should keep the quantum state within the
+# feasible subspace throughout the search. Therefore, unlike standard QAOA,
+# every candidate sampled by this AOA circuit should satisfy the
+# Hamming-weight-one constraint.
 
 # %%
 summary = sample_set.summary
@@ -434,12 +499,14 @@ print(
     f"Feasible samples: {total_feasible} / {total_samples} "
     f"({100 * total_feasible / total_samples:.1f}%)"
 )
+assert total_samples == final_shots
+assert total_feasible == total_samples, "AOA must only produce feasible colorings"
 
 # %% [markdown]
-# ### Best Feasible Solution
+# ### Best coloring
 #
-# `SampleSet.best_feasible` returns the feasible sample with the
-# best (here: smallest) objective.
+# `SampleSet.best_feasible` returns the feasible sample with the best (here:
+# smallest) objective, i.e. the fewest conflicts.
 
 # %%
 best = sample_set.best_feasible
@@ -452,74 +519,58 @@ for _, row in x_rows.iterrows():
     if row["value"] > 0.5:
         best_coloring[int(node)] = int(color)
 
+num_conflicts = sum(best_coloring[u] == best_coloring[v] for u, v in edge_list)
 print("Best coloring:", best_coloring)
-print("Number of Conflicts (neighbor nodes with the same color):", int(round(best.objective)))
+print("Number of conflicts (adjacent nodes with the same color):", num_conflicts)
+
+assert sorted(best_coloring) == list(range(num_nodes))
+assert num_conflicts == round(best.objective)
 
 # %% [markdown]
-# ### Objective Value Distribution
+# ### Objective value distribution
 #
-# We plot the distribution of the true objective value (number of conflicts).
+# We plot the distribution of the objective value, i.e. the number of
+# conflicts, over all samples.
 
 # %%
-obj_counts = summary.value_counts().sort_index()
+obj_counts = summary["objective"].value_counts().sort_index()
+assert obj_counts.sum() == total_samples
 
 plt.figure(figsize=(8, 4))
-plt.bar([str(o) for o in obj_counts.index], obj_counts.values, color="#2696EB")
-plt.xlabel("Conflicts (objective value)")
+plt.bar([str(int(o)) for o in obj_counts.index], obj_counts.values, color="#2696EB")
+plt.xlabel("Number of conflicts (objective value)")
 plt.ylabel("Frequency")
 plt.title("Distribution of Solutions")
 plt.show()
 
-
 # %% [markdown]
-# ### Visualize the Best 3-Coloring
+# ### Visualize the best coloring
 #
-# We color the graph nodes according to the best feasible coloring found by the Alternating Operator Ansatz algorithm.
+# We color the graph nodes according to the best coloring found by AOA.
 
 # %%
-def get_color_map_from_solution(best_coloring, num_colors):
-    """ Creates a color map for the best solution."""
+palette = ["#FF6B6B", "#4ECDC4", "#1A535C"]
+color_map = [palette[best_coloring[u]] for u in range(num_nodes)]
 
-    colors = ["#FF6B6B", "#4ECDC4", "#1A535C"]
-    color_map = []
-    for u in range(num_nodes):
-        color_idx = best_coloring.get(u, 0)  # default to 0 if node not found
-        color_map.append(colors[color_idx])
-    return color_map
-
-color_map = get_color_map_from_solution(best_coloring, num_colors)
-
-pos = nx.spring_layout(G, seed=1)
 plt.figure(figsize=(5, 5))
 nx.draw(
     G,
     pos,
     with_labels=True,
-    node_color=color_map if color_map else "white",
+    node_color=color_map,
     node_size=700,
     edgecolors="black",
 )
-plt.title(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+plt.title(f"Best coloring: {num_conflicts} conflict(s)")
 plt.show()
 
 # %% [markdown]
 # ## Summary
 #
-# In this tutorial we:
+# In this notebook, we:
 #
-# 1. Modeled the K-coloring problem with JijModeling — a one-hot variable
-#    per node and a Hamming-weight-1 constraint per node, converted to an
-#    Ising model via `BinaryModel`.
-# 2. Used `AOAConverter` to build the Alternating Operator Ansatz: the same
-#    Ising cost layer as QAOA, but with an XY mixer and a Dicke-state initial
-#    state that keep every sample within the one-hot feasible subspace.
-# 3. Inspected the building blocks — `prepare_dicke`, `ising_cost`, and
-#    `xy_mixer` — and how `block_size` partitions the register into one
-#    Dicke block per node.
-# 4. Optimized `gammas` and `betas` against the sampled mean energy, then
-#    sampled the optimized circuit and decoded the result back into OMMX
-#    `SampleSet` to check feasibility and visualize the best coloring.
-#
-# Because the AOA initial state and mixer already enforce the one-hot
-# constraint, every sampled bitstring is feasible by construction — the
-# optimizer only needs to minimize conflicts between adjacent nodes.
+# - Solved the graph coloring problem with the Alternating Operator Ansatz,
+#   using Qamomile's `AOAConverter`.
+# - Started from a superposition of valid colorings and used a mixer that only
+#   moves between valid colorings.
+# - Checked that every sampled solution gives each node exactly one color.
