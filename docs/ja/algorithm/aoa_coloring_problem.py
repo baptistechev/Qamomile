@@ -257,6 +257,8 @@ executable = converter.transpile(
 )
 
 fig = executable.quantum_circuit.draw("mpl", fold=-1, scale=2.2)
+assert executable.quantum_circuit.num_qubits == num_nodes * num_colors
+assert fig.get_axes()
 fig
 
 # %% [markdown]
@@ -306,15 +308,21 @@ executable_dicke = transpiler.transpile(
     },
 )
 
-executable_dicke.quantum_circuit.draw("mpl", fold=-1, scale=2.2)
+assert executable_dicke.quantum_circuit.num_qubits == num_nodes * num_colors
+
+fig = executable_dicke.quantum_circuit.draw("mpl", fold=-1, scale=2.2)
+assert fig.get_axes()
+fig
 
 # %%
-ising_cost.draw(
+fig = ising_cost.draw(
     q=converter.spin_model.num_bits,
     quad=converter.spin_model.quad,
     linear=converter.spin_model.linear,
     fold_loops=False,
 )
+assert fig.get_axes()
+fig
 
 # %%
 fig = xy_mixer.draw(
@@ -326,6 +334,7 @@ fig = xy_mixer.draw(
     inline_depth=None,
 )
 fig.set_size_inches(100, 8)
+assert fig.get_axes()
 fig
 
 # %% [markdown]
@@ -380,6 +389,8 @@ assert len(cost_history) == res.nfev
 assert len(res.x) == 2 * p
 
 # %%
+assert np.all(np.isfinite(cost_history))
+
 plt.figure(figsize=(8, 4))
 plt.plot(cost_history, color="#2696EB")
 plt.xlabel("Iteration")
@@ -469,6 +480,7 @@ plt.show()
 # %%
 palette = ["#FF6B6B", "#4ECDC4", "#1A535C"]
 color_map = [palette[best_coloring[u]] for u in range(num_nodes)]
+assert len(color_map) == num_nodes
 
 plt.figure(figsize=(5, 5))
 nx.draw(
