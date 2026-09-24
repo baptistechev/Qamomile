@@ -981,7 +981,7 @@ def _check_loop_carried_rebinds(
         # The frontend now represents non-condition while state explicitly,
         # but the circuit emit contract has no target-independent runtime
         # storage model for these values yet. Reject at analysis rather than
-        # letting segmentation or a backend fail ambiguously. Compile-time
+        # letting segmentation or an engine fail ambiguously. Compile-time
         # branch pruning can collapse a provisional carry to an identity,
         # which the normal identity-carry lowering removes later.
         collapsed = {result.uuid: source.uuid for result, source in body_merge_aliases}
@@ -2970,7 +2970,7 @@ def _check_loop_quantum_discards(
     the body, and it is not read after the loop. That is exactly the
     repeat-until-success pattern where ``qmc.qubit()`` denotes a fresh
     logical ``|0>`` per iteration; nested ``QInitOperation`` emission is
-    responsible for preparing/resetting the persistent backend wire.
+    responsible for preparing/resetting the persistent engine wire.
     In-body consumption of the incoming value itself remains NOT an
     exemption: the read re-executes against the traced register every
     iteration and matches Python semantics only for the first one.
@@ -3231,9 +3231,9 @@ def _check_loop_quantum_discards(
         # unrolled loops re-instantiate the body without carrying the
         # rebound register between iterations, and a runtime while
         # re-executes its body on one persistent register without reset,
-        # so "fresh per iteration" is not expressible either way (review
-        # measured an rx-gated while repeat-until-success body sampling
-        # the wire-reuse distribution, not the fresh-register one).
+        # so "fresh per iteration" is not expressible either way. An
+        # rx-gated repeat-until-success body would otherwise sample the
+        # wire-reuse distribution instead of the fresh-register one.
         if not record.after.type.is_quantum():
             raise _loop_nonquantum_overwrite_error(record.var_name, loop_kind)
         raise _loop_quantum_discard_error(record.var_name, loop_kind)
@@ -3684,7 +3684,7 @@ class AnalyzePass(Pass[Block, Block]):
 
         Store operations retain the exact source value and destination index,
         which is sufficient for host-side materialization and return values.
-        Backends do not yet allocate or alias a destination clbit for a
+        Engines do not yet allocate or alias a destination clbit for a
         user-created Bit array, so using a stored slot as an in-circuit
         condition would otherwise risk reading the wrong physical clbit.
 

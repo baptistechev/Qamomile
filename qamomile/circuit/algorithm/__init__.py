@@ -18,6 +18,19 @@ from .fqaoa import (
     initial_occupations,
     mixer_layer,
 )
+from .gas import (
+    apply_function_preparation_qubo,
+    apply_function_preparation_qubo_dagger,
+    diffusion_op,
+    first_degree_qft_encoding,
+    function_preparation_qubo,
+    function_preparation_qubo_dagger,
+    grover_algorithm,
+    grover_operator,
+    qft_encoding,
+    second_degree_qft_encoding,
+    zero_degree_qft_encoding,
+)
 from .qaoa import (
     hubo_ising_cost,
     hubo_qaoa_layers,
