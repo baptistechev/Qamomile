@@ -26,12 +26,12 @@ def _executor(case: Any) -> Any:
     """Return a local simulator executor for one SDK fixture case.
 
     Args:
-        case (Any): SDK fixture bundling a backend name and transpiler.
+        case (Any): SDK fixture bundling an engine name and transpiler.
 
     Returns:
         Any: Executor bound to a local statevector simulator.
     """
-    if case.backend_name == "qiskit":
+    if case.engine_name == "qiskit":
         from qiskit.providers.basic_provider import BasicSimulator
 
         return case.transpiler.executor(backend=BasicSimulator())
@@ -201,6 +201,26 @@ def _to_reflection_phases(wx_phases: np.ndarray) -> list[float]:
     phases[-1] += math.pi / 4
     phases[1:-1] += math.pi / 2
     return [float(phase) for phase in phases]
+
+
+def _to_wx_phases(phases: list[float]) -> np.ndarray:
+    """Convert projector-rotation phases back to the Wx convention.
+
+    Exact inverse of :func:`_to_reflection_phases`, so a test can bind chosen
+    reflection-convention phases to :func:`qmc.qsvt` directly and still use
+    :func:`_wx_qsp_polynomial` as its reference.
+
+    Args:
+        phases (list[float]): Phases the QSVT primitive consumes.
+
+    Returns:
+        np.ndarray: The same sequence in the Wx (signal-rotation) convention.
+    """
+    wx_phases = np.asarray(phases, dtype=float).copy()
+    wx_phases[0] -= math.pi / 4
+    wx_phases[-1] -= math.pi / 4
+    wx_phases[1:-1] -= math.pi / 2
+    return wx_phases
 
 
 def _reference_qsvt(
@@ -382,7 +402,7 @@ def _assert_probe_matches_on_sdk(
     """Run the probe's sampling and estimation paths and check both.
 
     Args:
-        sdk_transpiler (Any): SDK fixture bundling a backend name and
+        sdk_transpiler (Any): SDK fixture bundling an engine name and
             transpiler.
         encoding (qmc.LCUBlockEncoding): Encoding under test.
         phases (list[float]): Reflection-convention phases to bind.
@@ -408,7 +428,7 @@ def _assert_probe_matches_on_sdk(
         bindings={"phi": phases, "observable": _zero_projector(num_ancilla)},
     )
     observed = float(expval.run(_executor(sdk_transpiler)).result())
-    atol = 1e-6 if sdk_transpiler.backend_name == "cudaq" else 1e-8
+    atol = 1e-6 if sdk_transpiler.engine_name == "cudaq" else 1e-8
     assert observed == pytest.approx(success, abs=atol)
 
 
@@ -456,17 +476,17 @@ def test_probe_with_a_two_qubit_signal_register_on_every_sdk(
 
     The phases are fixed rather than random so that the boundary angles are
     always exercised: ``0`` and ``2*pi`` are the same rotation, ``pi`` is its
-    opposite, and a backend that wraps or elides one of them fails here.
+    opposite, and a backend that wraps or elides one of them fails here. They
+    are bound to ``qmc.qsvt`` as-is (reflection convention), and only the
+    reference converts them back to the Wx convention.
     """
     coefficients = {(0,): 0.4, (1,): -0.7, (0, 1): 0.55}
     num_system_qubits = 2
-    wx_phases = np.array([0.0, math.pi, 2.0 * math.pi, math.pi / 3])
+    phases = [0.0, math.pi, 2.0 * math.pi, math.pi / 3]
     encoding = qmc.ising_z_block_encoding(coefficients, num_system_qubits)
     assert encoding.num_signal_qubits == 2
 
     success = _expected_success_probability(
-        coefficients, num_system_qubits, encoding, wx_phases
+        coefficients, num_system_qubits, encoding, _to_wx_phases(phases)
     )
-    _assert_probe_matches_on_sdk(
-        sdk_transpiler, encoding, _to_reflection_phases(wx_phases), success
-    )
+    _assert_probe_matches_on_sdk(sdk_transpiler, encoding, phases, success)

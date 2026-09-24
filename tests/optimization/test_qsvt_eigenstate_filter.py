@@ -454,9 +454,10 @@ def test_decode_rejects_results_that_are_not_probe_measurements() -> None:
 def test_ommx_decode_post_selects_before_evaluating_the_original_instance() -> None:
     """The OMMX output path sees only the post-selected shots.
 
-    ``decode`` is inherited from the base converter and routes through this
-    class's ``decode_to_binary_sampleset`` override, so the projector/signal
-    post-selection must survive all the way into the ``ommx.v1.SampleSet``.
+    ``decode`` is overridden to accept the probe's ``(projector, signal,
+    system)`` payload and routes through ``decode_to_binary_sampleset``, so the
+    projector/signal post-selection must survive all the way into the
+    ``ommx.v1.SampleSet``.
 
     The QUBO energy is derived by hand: with ``objective = -10 * x0`` and the
     equality ``x0 + x1 == 1`` absorbed at penalty weight 2, the kept shot
@@ -475,7 +476,7 @@ def test_ommx_decode_post_selects_before_evaluating_the_original_instance() -> N
     converter = QSVTEigenstateFilterConverter(instance, uniform_penalty_weight=2.0)
 
     # Measured bit 1 decodes to spin -1, i.e. binary 1.
-    raw: SampleResult[Any] = SampleResult(
+    raw: SampleResult[tuple[list[int], list[int], list[int]]] = SampleResult(
         results=[
             (([0], [0], [1, 1]), 3),  # kept: every ancilla zero
             (([1], [0], [0, 1]), 1),  # dropped: projector fired
@@ -501,7 +502,9 @@ def test_success_probability_of_an_empty_result_is_zero() -> None:
     """A zero-shot result reports no filtered weight instead of dividing by 0."""
     model = BinaryModel.from_higher_ising({(0,): 1.0})
     converter = QSVTEigenstateFilterConverter(model)
-    empty: SampleResult[Any] = SampleResult(results=[], shots=0)
+    empty: SampleResult[tuple[list[int], list[int], list[int]]] = SampleResult(
+        results=[], shots=0
+    )
 
     assert converter.success_probability(empty) == 0.0
 
@@ -524,7 +527,7 @@ def test_a_fully_rejected_result_decodes_to_nothing() -> None:
     )
     converter = QSVTEigenstateFilterConverter(instance, uniform_penalty_weight=2.0)
 
-    raw: SampleResult[Any] = SampleResult(
+    raw: SampleResult[tuple[list[int], list[int], list[int]]] = SampleResult(
         results=[
             (([1], [0], [0, 1]), 3),  # dropped: projector fired
             (([0], [1], [1, 0]), 2),  # dropped: signal register non-zero

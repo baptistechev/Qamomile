@@ -183,7 +183,14 @@ instance = problem.eval(instance_data)
 # %% [markdown]
 # ## Implementation with Qamomile
 #
-# `QSVTEigenstateFilterConverter` is called directly on the problem instance.
+# Qamomile provides the eigenstate-filtering algorithm described above as
+# `QSVTEigenstateFilterConverter` in `qamomile.optimization.qsvt_eigenstate_filter`.
+# The converter builds the block encoding of the problem Hamiltonian, synthesizes
+# the filter phases, assembles the probe circuit, and post-selects and decodes the
+# measured samples, so the whole procedure runs directly from the problem
+# instance. Below, we first use it to test one threshold, then open up the
+# building blocks it assembles, and finally drive the binary search with it.
+#
 # Several internal parameters decide the solution quality, and we explain each of
 # them below, as well as how to choose them.
 #
