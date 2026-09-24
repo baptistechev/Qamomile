@@ -15,6 +15,12 @@ Solve K-coloring with the Alternating Operator Ansatz, using a Dicke-state initi
 :::
 
 :::{card}
+:header: **Grover Adaptive Search for Combinatorial Polynomial Binary Optimization**
+:link: grover_adaptive_search
+Solve a portfolio selection problem with `GASConverter`, driving the Grover threshold from a classical outer loop and checking the result against brute force.
+:::
+
+:::{card}
 :header: **Hamiltonian Simulation with Suzuki–Trotter (Rabi oscillation)**
 :link: hamiltonian_simulation
 Trotter–Suzuki product formulas on the Rabi model with empirical convergence orders.
@@ -30,6 +36,12 @@ End-to-end CNN + quantum variational circuit on Fashion-MNIST with the parameter
 :header: **Möttönen Amplitude Encoding**
 :link: mottonen_amplitude_encoding.ipynb
 Learn how to use Möttönen amplitude encoding in Qamomile to prepare arbitrary quantum states. This tutorial introduces state preparation based on `amplitude_encoding` and `mottonen_amplitude_encoding`.
+:::
+
+:::{card}
+:header: **Option Pricing with Quantum Amplitude Estimation**
+:link: option_pricing
+An example of option pricing with quantum amplitude estimation (QAE) in Qamomile. It encodes stock-price data into amplitudes, implements amplitude estimation with the Grover operator, and runs a numerical option-pricing simulation.
 :::
 
 :::{card}

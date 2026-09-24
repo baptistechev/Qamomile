@@ -15,6 +15,12 @@ Dicke状態による初期状態とXYミキサーを使い、ワンホットの�
 :::
 
 :::{card}
+:header: **組合せ多項式二値最適化のためのGrover Adaptive Search**
+:link: grover_adaptive_search
+`GASConverter`でポートフォリオ選択問題を解く例です。古典的な外側ループからGroverの閾値を更新し、結果を全探索と比較して検証します。
+:::
+
+:::{card}
 :header: **Suzuki–Trotter分解によるハミルトニアンシミュレーション (Rabi振動)**
 :link: hamiltonian_simulation
 RabiモデルでのTrotter–Suzuki積公式と収束次数の実験です。
@@ -30,6 +36,12 @@ CNN＋量子変分回路をFashion-MNISTでend-to-end学習し、パラメータ
 :header: **Möttönen振幅エンコーディング**
 :link: mottonen_amplitude_encoding.ipynb
 任意の量子状態を準備するMöttönenの振幅エンコーディングをQamomileで使う方法です。`amplitude_encoding`および`mottonen_amplitude_encoding`に基づく状態準備の方法を紹介します。
+:::
+
+:::{card}
+:header: **量子振幅推定を用いたオプションプライシング**
+:link: option_pricing
+量子振幅推定(QAE)によるオプションプライシングをQamomileで実装する例です。株価データの振幅への埋め込みと、Grover演算子による振幅推定を実装し、オプションの数値シミュレーションを実行します。
 :::
 
 :::{card}

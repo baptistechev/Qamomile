@@ -27,6 +27,7 @@ _FRONTEND_ANNOTATION_KIND_TO_PROTO: dict[str, pb.FrontendAnnotationKind] = {
     "PYTHON_BOOL": pb.PYTHON_BOOL,
     "QAMOMILE_QUBIT": pb.QAMOMILE_QUBIT,
     "QAMOMILE_QFIXED": pb.QAMOMILE_QFIXED,
+    "QAMOMILE_QINT": pb.QAMOMILE_QINT,
     "QAMOMILE_OBSERVABLE": pb.QAMOMILE_OBSERVABLE,
     "QAMOMILE_VECTOR": pb.QAMOMILE_VECTOR,
     "QAMOMILE_MATRIX": pb.QAMOMILE_MATRIX,
@@ -1152,6 +1153,8 @@ _OPERATION_TO_PROTO: dict[str, pb.OperationType] = {
     "MeasureVectorOperation": pb.MEASURE_VECTOR_OPERATION,
     "MeasureQFixedOperation": pb.MEASURE_QFIXED_OPERATION,
     "DecodeQFixedOperation": pb.DECODE_QFIXED_OPERATION,
+    "MeasureQIntOperation": pb.MEASURE_QINT_OPERATION,
+    "DecodeQIntOperation": pb.DECODE_QINT_OPERATION,
     "StoreArrayElementOperation": pb.STORE_ARRAY_ELEMENT_OPERATION,
     "DictGetItemOperation": pb.DICT_GET_ITEM_OPERATION,
     "CastOperation": pb.CAST_OPERATION,
@@ -1192,6 +1195,8 @@ _OPERATION_ALLOWED_FIELDS: dict[pb.OperationType, frozenset[str]] = {
     pb.MEASURE_VECTOR_OPERATION: frozenset(),
     pb.MEASURE_QFIXED_OPERATION: frozenset({"num_bits", "int_bits"}),
     pb.DECODE_QFIXED_OPERATION: frozenset({"num_bits", "int_bits"}),
+    pb.MEASURE_QINT_OPERATION: frozenset(),
+    pb.DECODE_QINT_OPERATION: frozenset(),
     pb.STORE_ARRAY_ELEMENT_OPERATION: frozenset(),
     pb.DICT_GET_ITEM_OPERATION: frozenset({"key_arity"}),
     pb.CAST_OPERATION: frozenset({"source_type", "target_type", "qubit_mapping"}),
@@ -1294,9 +1299,9 @@ _OPERATION_ALLOWED_FIELDS: dict[pb.OperationType, frozenset[str]] = {
             "case_blocks",
             "num_index_qubits_ref",
             "num_index_args",
+            "callable_attrs",
         }
     ),
-    pb.GLOBAL_PHASE_OPERATION: frozenset(),
     pb.RETURN_QUANTUM_ARRAY_ELEMENT_OPERATION: frozenset(),
 }
 
@@ -1937,7 +1942,7 @@ def _signature_from_proto(message: pb.Signature) -> dict[str, Any]:
 
 
 def _implementation_to_proto(value: dict[str, Any]) -> pb.CallableImplementation:
-    """Encode a backend-neutral callable implementation candidate.
+    """Encode an engine-neutral callable implementation candidate.
 
     Args:
         value (dict[str, Any]): Implementation record without an emitter object.
@@ -1950,8 +1955,8 @@ def _implementation_to_proto(value: dict[str, Any]) -> pb.CallableImplementation
         TypeError: If attrs contain an unsupported payload.
     """
     message = pb.CallableImplementation(transform=value["transform"])
-    if value.get("backend") is not None:
-        message.backend = value["backend"]
+    if value.get("engine") is not None:
+        message.engine = value["engine"]
     if value.get("strategy") is not None:
         message.strategy = value["strategy"]
     if value.get("body") is not None:
@@ -1978,7 +1983,7 @@ def _implementation_from_proto(
     """
     return {
         "transform": message.transform,
-        "backend": message.backend if message.HasField("backend") else None,
+        "engine": message.engine if message.HasField("engine") else None,
         "strategy": message.strategy if message.HasField("strategy") else None,
         "body": _block_from_proto(message.body) if message.HasField("body") else None,
         "body_ref": (
@@ -1991,7 +1996,7 @@ def _implementation_from_proto(
 
 
 def _callable_definition_to_proto(value: dict[str, Any]) -> pb.CallableDefinition:
-    """Encode a callable definition without resource-estimation annotations.
+    """Encode a callable definition with an optional fixed opaque cost.
 
     Args:
         value (dict[str, Any]): Callable-definition graph record.
@@ -2015,6 +2020,8 @@ def _callable_definition_to_proto(value: dict[str, Any]) -> pb.CallableDefinitio
         _implementation_to_proto(item) for item in value["implementations"]
     )
     message.attrs.CopyFrom(_payload_to_proto(value["attrs"]))
+    if value.get("opaque_cost") is not None:
+        message.opaque_cost.CopyFrom(_payload_to_proto(value["opaque_cost"]))
     return message
 
 
@@ -2027,7 +2034,8 @@ def _callable_definition_from_proto(
         message (pb.CallableDefinition): Typed algorithm definition.
 
     Returns:
-        dict[str, Any]: Internal definition record with no ``opaque_cost``.
+        dict[str, Any]: Internal definition record with an optional fixed
+            ``opaque_cost`` payload.
 
     Raises:
         ValueError: If nested graph records are malformed.
@@ -2048,6 +2056,11 @@ def _callable_definition_from_proto(
         "implementations": [
             _implementation_from_proto(item) for item in message.implementations
         ],
+        "opaque_cost": (
+            _payload_from_proto(message.opaque_cost)
+            if message.HasField("opaque_cost")
+            else None
+        ),
         "default_policy": message.default_policy,
         "attrs": _payload_from_proto(message.attrs),
     }
