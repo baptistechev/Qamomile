@@ -1,281 +1,594 @@
-"""Unified resource estimation interface.
-
-This module combines all resource metrics (qubits, gates)
-into a single interface for comprehensive circuit analysis.
-"""
+"""Expose the public resource-estimation API."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+import dataclasses
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 import sympy as sp
 
-from qamomile.circuit.estimator.gate_counter import GateCount, count_gates
-from qamomile.circuit.estimator.qubits_counter import qubits_counter
+from qamomile.circuit.estimator._input_contract import (
+    _contract_names,
+    _expand_array_shape_inputs,
+    _root_callable_resource_attrs,
+    _root_callable_shape_inputs,
+    _scalar_input_types,
+)
+from qamomile.circuit.estimator._resolver import (
+    ExprResolver,
+)
+from qamomile.circuit.estimator._resource_base import (
+    ApproximationStatus,
+    ControlDecomposition,
+    EstimateDerivation,
+    EstimateQuality,
+)
+from qamomile.circuit.estimator._resource_types import (
+    CallResources,
+    DepthResources,
+    GateResources,
+    MeasurementResources,
+    ResetResources,
+    ResourceAssumption,
+    ResourceTraceNode,
+    WidthResources,
+)
+from qamomile.circuit.ir.block import Block
+from qamomile.circuit.ir.operation.operation import (
+    Operation,
+)
+from qamomile.circuit.ir.value import ArrayValue, Value, ValueBase
 
 if TYPE_CHECKING:
-    from qamomile.circuit.ir.block import Block
-    from qamomile.circuit.ir.operation.operation import Operation
+    from qamomile.circuit.frontend.qkernel import QKernel
+
+from qamomile.circuit.estimator._classical_provenance import (
+    _LoopMayTaint as _LoopMayTaint,
+)
+from qamomile.circuit.estimator._config import (
+    _DEFAULT_CONTROL_DECOMPOSITION,
+    UnknownResourcePolicy,
+    _ResourceEstimatorConfig,
+)
+from qamomile.circuit.estimator._constraints import (
+    _quantum_operand_width_constraints,
+)
+from qamomile.circuit.estimator._control_model import (
+    _EstimatorControlBatchProfile as _EstimatorControlBatchProfile,
+)
+from qamomile.circuit.estimator._estimate import ResourceEstimate
+from qamomile.circuit.estimator._estimate_composition import (
+    _SequentialEstimateComposer as _SequentialEstimateComposer,
+)
+from qamomile.circuit.estimator._estimate_domain import _DomainRewritePolicy
+from qamomile.circuit.estimator._estimate_provenance import (
+    _DEFER_RESOURCE_SYMBOL_METADATA,
+)
+from qamomile.circuit.estimator._estimate_validation import _with_constraints
+from qamomile.circuit.estimator._inputs import (
+    _apply_inputs,
+    _estimator_parameters,
+    _partition_estimation_inputs,
+    _root_input_binding_context,
+    _scalar_values,
+    _substitute_bindings,
+    _validate_explicit_estimation_inputs,
+)
+from qamomile.circuit.estimator._interpreter import ResourceInterpreter
+from qamomile.circuit.estimator._interpreter_dataflow import (
+    _ResourceInlineBoundaryOperation as _ResourceInlineBoundaryOperation,
+)
+from qamomile.circuit.estimator._opaque import (
+    OpaqueCostContext,
+    _OpaqueInvocationTransform as _OpaqueInvocationTransform,
+)
+from qamomile.circuit.estimator._product_formula import (
+    _apply_product_formula_contract,
+    _require_concrete_product_formula_structure,
+)
+from qamomile.circuit.estimator._resource_constraints import (
+    _mark_root_domain_constraints,
+)
+from qamomile.circuit.estimator._symbolic import (
+    _CappedRangeSum as _CappedRangeSum,
+)
+
+__all__ = [
+    "ApproximationStatus",
+    "CallResources",
+    "ControlDecomposition",
+    "DepthResources",
+    "EstimateDerivation",
+    "EstimateQuality",
+    "GateResources",
+    "OpaqueCostContext",
+    "MeasurementResources",
+    "ResetResources",
+    "ResourceAssumption",
+    "ResourceEstimate",
+    "ResourceEstimator",
+    "ResourceInterpreter",
+    "ResourceTraceNode",
+    "UnknownResourcePolicy",
+    "WidthResources",
+    "estimate_resources",
+]
 
 
-@dataclass
-class ResourceEstimate:
-    """Comprehensive resource estimate for a quantum circuit.
+def _root_formal_resource_symbols(
+    block: Block,
+    resolver: ExprResolver,
+) -> dict[sp.Symbol, str]:
+    """Resolve exact root-formal symbol identities and stable input names.
 
-    All metrics are SymPy expressions that may contain symbols
-    for parametric problem sizes.
+    Args:
+        block (Block): Root qkernel block whose interface is authoritative.
+        resolver (ExprResolver): Resolver configured for the root interface.
 
-    Attributes:
-        qubits: Logical qubit count
-        gates: Gate count breakdown (total, single_qubit, two_qubit, t_gates, clifford)
-        parameters: Dictionary mapping symbol names to their SymPy symbols
+    Returns:
+        dict[sp.Symbol, str]: Exact symbolic identities mapped to formal names.
+    """
+    slot_names = tuple(dict.fromkeys(slot.name for slot in block.param_slots))
+    values_by_name: dict[str, ValueBase] = {
+        value.name: value
+        for value in (*block.input_values, *block.parameters.values())
+        if isinstance(value, (Value, ArrayValue)) and value.name
+    }
+    symbols: dict[sp.Symbol, str] = {}
+    for name in slot_names:
+        value = values_by_name.get(name)
+        if isinstance(value, Value):
+            expression = resolver.resolve(value)
+            if isinstance(expression, sp.Symbol):
+                symbols[expression] = name
+    input_names = (
+        {
+            value.uuid: name
+            for name, value in zip(block.label_args, block.input_values, strict=True)
+        }
+        if len(block.label_args) == len(block.input_values)
+        else {}
+    )
+    for value in block.input_values:
+        if not isinstance(value, ArrayValue):
+            continue
+        formal_name = input_names.get(value.uuid) or value.name or "input"
+        for dimension in value.shape:
+            expression = resolver.resolve(dimension)
+            for symbol in cast(set[sp.Symbol], expression.free_symbols):
+                symbols[symbol] = formal_name
+    return symbols
+
+
+class ResourceEstimator:
+    """Estimate algorithmic resources for qkernels and IR blocks.
+
+    Args:
+        strategies (dict[str, str] | None): Strategy overrides by callable
+            name. Defaults to ``None``.
+        trace (bool): Whether to keep explanation traces. Defaults to
+            ``False``.
+        simplify (bool): Whether to simplify final expressions, including
+            simplification over valid qkernel input conditions. Defaults to
+            ``True``.
+        unknown_policy (str | UnknownResourcePolicy): Handling for unknown
+            bodyless callables. Defaults to ``ERROR``.
+        control_decomposition (str | ControlDecomposition): Coherent-control
+            decomposition. Defaults to ``CLEAN_ANCILLA_TOFFOLI``.
+
+    Raises:
+        ValueError: If ``unknown_policy`` or ``control_decomposition`` is
+            unknown.
     """
 
-    qubits: sp.Expr
-    gates: GateCount
-    parameters: dict[str, sp.Symbol] = field(default_factory=dict)
-
-    def substitute(self, **values: int | float) -> ResourceEstimate:
-        """Substitute concrete values for parameters.
+    def __init__(
+        self,
+        *,
+        strategies: dict[str, str] | None = None,
+        trace: bool = False,
+        simplify: bool = True,
+        unknown_policy: str | UnknownResourcePolicy = UnknownResourcePolicy.ERROR,
+        control_decomposition: str
+        | ControlDecomposition = _DEFAULT_CONTROL_DECOMPOSITION,
+    ) -> None:
+        """Initialize a resource estimator.
 
         Args:
-            **values: Parameter name -> concrete value mappings
+            strategies (dict[str, str] | None): Strategy overrides by callable
+                name. Defaults to ``None``.
+            trace (bool): Whether to keep explanation traces. Defaults to
+                ``False``.
+            simplify (bool): Whether to simplify the final estimate, including
+                simplification under valid qkernel input conditions. Consumed
+                conditions remain visible in ``ResourceEstimate.assumptions``.
+                Set to ``False`` to preserve the unconditional symbolic
+                formulas; calling ``ResourceEstimate.simplify()`` later
+                explicitly enables the domain-aware pass. Defaults to ``True``.
+            unknown_policy (str | UnknownResourcePolicy): Handling for unknown
+                bodyless callables. Defaults to ``ERROR``.
+            control_decomposition (str | ControlDecomposition):
+                Coherent-control decomposition. Defaults to
+                ``CLEAN_ANCILLA_TOFFOLI``.
 
-        Returns:
-            New ResourceEstimate with substituted values
-
-        Example:
-            >>> est = estimate_resources(circuit)
-            >>> concrete = est.substitute(n=100, p=3)
-            >>> print(concrete.qubits)  # 100 (instead of 'n')
+        Raises:
+            ValueError: If ``unknown_policy`` or ``control_decomposition`` is
+                unknown.
         """
-        # Find matching symbols from the parameters dict. Typed as
-        # ``dict[Any, Any]`` so the call to ``sp.Expr.subs`` further down
-        # accepts it — sympy's stub requires
-        # ``Mapping[Basic | complex, Expr | complex]`` and ``dict`` /
-        # ``Mapping`` are invariant in the key type, so a narrower
-        # declaration like ``dict[sp.Symbol, int]`` does not type-check.
-        subs_dict: dict[Any, Any] = {}
-        for key, val in values.items():
-            # Look for symbol in parameters dict
-            if key in self.parameters:
-                subs_dict[self.parameters[key]] = val
-            else:
-                # Try creating a symbol (for cases where parameters weren't tracked)
-                subs_dict[sp.Symbol(key, integer=True, positive=True)] = val
-
-        def _subs_eval(expr: sp.Expr) -> sp.Expr:
-            if isinstance(expr, (int, float)):  # type: ignore[unreachable]
-                return sp.Integer(expr)  # type: ignore[unreachable]
-            return expr.subs(subs_dict).doit()
-
-        return ResourceEstimate(
-            qubits=_subs_eval(self.qubits),
-            gates=GateCount(
-                total=_subs_eval(self.gates.total),
-                single_qubit=_subs_eval(self.gates.single_qubit),
-                two_qubit=_subs_eval(self.gates.two_qubit),
-                multi_qubit=_subs_eval(self.gates.multi_qubit),
-                t_gates=_subs_eval(self.gates.t_gates),
-                clifford_gates=_subs_eval(self.gates.clifford_gates),
-                rotation_gates=_subs_eval(self.gates.rotation_gates),
-                oracle_calls={
-                    name: _subs_eval(val)
-                    for name, val in self.gates.oracle_calls.items()
-                },
-                oracle_queries={
-                    name: _subs_eval(val)
-                    for name, val in self.gates.oracle_queries.items()
-                },
-            ),
-            parameters=self.parameters,
+        try:
+            normalized_unknown_policy = UnknownResourcePolicy(unknown_policy)
+        except ValueError as error:
+            valid = ", ".join(member.value for member in UnknownResourcePolicy)
+            raise ValueError(
+                f"unknown resource policy {unknown_policy!r}; expected one of: {valid}"
+            ) from error
+        try:
+            normalized_control_decomposition = ControlDecomposition(
+                control_decomposition
+            )
+        except ValueError as error:
+            valid = ", ".join(member.value for member in ControlDecomposition)
+            raise ValueError(
+                "unknown control decomposition "
+                f"{control_decomposition!r}; expected one of: {valid}"
+            ) from error
+        self.config = _ResourceEstimatorConfig(
+            strategies=dict(strategies or {}),
+            trace=trace,
+            simplify=simplify,
+            unknown_policy=normalized_unknown_policy,
+            control_decomposition=normalized_control_decomposition,
         )
 
-    def simplify(self) -> ResourceEstimate:
-        """Simplify all SymPy expressions.
+    def estimate(
+        self,
+        kernel: "QKernel[Any, Any] | Block | Sequence[Operation]",
+        *,
+        inputs: dict[str, Any] | None = None,
+        strategies: dict[str, str] | None = None,
+    ) -> ResourceEstimate:
+        """Estimate algorithmic resources for a qkernel, block, or operations.
+
+        Args:
+            kernel (QKernel[Any, Any] | Block | Sequence[Operation]): Object to
+                estimate. QKernel-like objects are built before traversal.
+            inputs (dict[str, Any] | None): QKernel input values used to
+                specialize the symbolic estimate without constructing a
+                problem-sized circuit. Exact one-dimensional root quantum-port
+                widths declared by callable resource metadata are inferred
+                when omitted. Defaults to ``None``.
+            strategies (dict[str, str] | None): Per-call override merged over
+                estimator-level strategies. Defaults to ``None``.
 
         Returns:
-            New ResourceEstimate with simplified expressions
+            ResourceEstimate: Algorithmic resource estimate.
+
+        Raises:
+            RuntimeError: If a fixed or callback-provided opaque cost contains
+                public metrics or metadata that disagree with retained
+                canonical provenance.
+            ValueError: If an input name is unknown, a callable resource
+                contract is malformed or violated, or a structural resource
+                requirement fails.
+            TypeError: If ``kernel`` is not a supported estimator input.
+            NotImplementedError: If the input IR contains a construct not
+                supported by resource estimation.
         """
-        return ResourceEstimate(
-            qubits=sp.simplify(self.qubits),
-            gates=self.gates.simplify(),
-            parameters=self.parameters,
+        defer_token = _DEFER_RESOURCE_SYMBOL_METADATA.set(True)
+        try:
+            estimate = self._estimate_deferred(
+                kernel,
+                inputs=inputs,
+                strategies=strategies,
+            )
+        finally:
+            _DEFER_RESOURCE_SYMBOL_METADATA.reset(defer_token)
+        estimate._refresh_symbol_metadata()
+        return estimate
+
+    def _estimate_deferred(
+        self,
+        kernel: "QKernel[Any, Any] | Block | Sequence[Operation]",
+        *,
+        inputs: dict[str, Any] | None = None,
+        strategies: dict[str, str] | None = None,
+    ) -> ResourceEstimate:
+        """Estimate resources while deferring public symbol derivation.
+
+        The public :meth:`estimate` wrapper activates the deferral context and
+        refreshes aliases and parameters exactly once on the final result.
+
+        Args:
+            kernel (QKernel[Any, Any] | Block | Sequence[Operation]): Object to
+                estimate. QKernel-like objects are built before traversal.
+            inputs (dict[str, Any] | None): Values used to specialize symbolic
+                qkernel inputs. Defaults to ``None``.
+            strategies (dict[str, str] | None): Per-call strategy overrides.
+                Defaults to ``None``.
+
+        Returns:
+            ResourceEstimate: Estimate awaiting one final public-symbol
+            metadata refresh.
+
+        Raises:
+            ValueError: If an input, callable resource contract, or structural
+                requirement is invalid.
+            TypeError: If ``kernel`` is not a supported estimator input.
+            NotImplementedError: If the input contains an unsupported
+                construct.
+        """
+        explicit_inputs = _validate_explicit_estimation_inputs(
+            kernel,
+            inputs or {},
         )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to a dictionary for serialization.
-
-        Returns:
-            Dictionary with all metrics as strings (for JSON/YAML export)
-
-        Example:
-            >>> est = estimate_resources(circuit)
-            >>> data = est.to_dict()
-            >>> import json
-            >>> print(json.dumps(data, indent=2))
-        """
-        return {
-            "qubits": str(self.qubits),
-            "gates": {
-                "total": str(self.gates.total),
-                "single_qubit": str(self.gates.single_qubit),
-                "two_qubit": str(self.gates.two_qubit),
-                "multi_qubit": str(self.gates.multi_qubit),
-                "t_gates": str(self.gates.t_gates),
-                "clifford_gates": str(self.gates.clifford_gates),
-                "rotation_gates": str(self.gates.rotation_gates),
-                "oracle_calls": {
-                    name: str(val) for name, val in self.gates.oracle_calls.items()
-                },
-                "oracle_queries": {
-                    name: str(val) for name, val in self.gates.oracle_queries.items()
-                },
-            },
-            "parameters": {k: str(v) for k, v in self.parameters.items()},
+        root_callable_attrs = _root_callable_resource_attrs(kernel)
+        build_inputs, estimation_inputs = _partition_estimation_inputs(
+            kernel,
+            explicit_inputs,
+        )
+        block_or_ops = self._coerce_input(
+            kernel,
+            build_inputs,
+            estimation_inputs,
+        )
+        config = dataclasses.replace(
+            self.config,
+            strategies={**self.config.strategies, **dict(strategies or {})},
+        )
+        condition_values = _scalar_values({**build_inputs, **estimation_inputs})
+        interpreter = ResourceInterpreter(
+            config=config,
+            bindings=build_inputs,
+            condition_values=condition_values,
+        )
+        if isinstance(block_or_ops, Block):
+            _require_concrete_product_formula_structure(
+                root_callable_attrs,
+                block_or_ops.input_values,
+                bindings={**build_inputs, **condition_values},
+                resolver=ExprResolver(
+                    block=block_or_ops,
+                    context=_root_input_binding_context(
+                        block_or_ops,
+                        build_inputs,
+                    ),
+                ),
+                specialize=lambda expression: interpreter._apply_condition_values(
+                    expression,
+                    record_usage=False,
+                ),
+                source=getattr(kernel, "name", None) or block_or_ops.name or "qkernel",
+            )
+        estimate = interpreter.estimate(block_or_ops)
+        # Boundary liveness is interpreter-local metadata. A root estimate can
+        # later be reused as an opaque definition cost, where caller owner
+        # identities would be meaningless and unserializable. Drop it before
+        # public symbol discovery so private size expressions cannot introduce
+        # public parameters either.
+        estimate = dataclasses.replace(
+            estimate,
+            _output_sizes={},
+            _input_sizes={},
+            _has_output_summary=False,
+        )
+        root_source = getattr(kernel, "name", None) or (
+            block_or_ops.name if isinstance(block_or_ops, Block) else "qkernel"
+        )
+        if isinstance(block_or_ops, Block):
+            root_resolver = ExprResolver(
+                block=block_or_ops,
+                context=_root_input_binding_context(
+                    block_or_ops,
+                    build_inputs,
+                ),
+            )
+            estimate = _apply_product_formula_contract(
+                estimate,
+                root_callable_attrs,
+                block_or_ops.input_values,
+                root_resolver,
+                bindings=build_inputs,
+                specialize=lambda expression: interpreter._apply_condition_values(
+                    expression,
+                    record_usage=False,
+                ),
+                source=root_source,
+            )
+            estimate = _with_constraints(
+                estimate,
+                *_quantum_operand_width_constraints(
+                    root_callable_attrs,
+                    block_or_ops.input_values,
+                    root_resolver,
+                    source=root_source,
+                ),
+            )
+        # Runtime-domain alternatives may contain ordinary qkernel symbols.
+        # Expand them before applying user inputs so the normal substitution
+        # and constraint validation path specializes every alternative rather
+        # than reintroducing an already supplied symbol afterward.
+        estimate = interpreter.resolve_finite_runtime_constraints(estimate)
+        if isinstance(block_or_ops, Block):
+            formal_resolver = ExprResolver(
+                block=block_or_ops,
+                context=_root_input_binding_context(
+                    block_or_ops,
+                    build_inputs,
+                ),
+            )
+            formal_symbols = _root_formal_resource_symbols(
+                block_or_ops,
+                formal_resolver,
+            )
+            estimate = dataclasses.replace(
+                estimate,
+                _constraints=_mark_root_domain_constraints(
+                    estimate._constraints,
+                    formal_symbols,
+                ),
+            )
+        if build_inputs:
+            estimate._refresh_symbol_metadata()
+            estimate = _substitute_bindings(estimate, build_inputs)
+        inferred_shape_inputs = _root_callable_shape_inputs(
+            root_callable_attrs,
+            block_or_ops,
+            explicit_inputs,
+            source=root_source,
+        )
+        effective_estimation_inputs = {
+            **inferred_shape_inputs,
+            **estimation_inputs,
         }
+        expanded_estimation_inputs, shape_input_names = _expand_array_shape_inputs(
+            block_or_ops,
+            effective_estimation_inputs,
+        )
+        if effective_estimation_inputs:
+            estimate = _apply_inputs(
+                estimate,
+                expanded_estimation_inputs,
+                contract_names=_contract_names(block_or_ops),
+                input_types=_scalar_input_types(block_or_ops),
+                branch_condition_names=interpreter.branch_condition_names,
+                consumed_input_names=shape_input_names,
+            )
+        if not config.trace:
+            # Large recursive call bodies can produce an explanation tree
+            # deeper than Python's recursion limit.  A disabled trace is not
+            # observable, so discard it before symbolic mapping/simplification.
+            estimate = dataclasses.replace(estimate, trace=None)
+        interpreter.validate_no_internal_resource_symbols(estimate)
+        if config.simplify:
+            estimate = estimate.simplify()
+        else:
+            estimate = dataclasses.replace(
+                estimate,
+                _domain_rewrite_policy=_DomainRewritePolicy.DISABLED,
+            )
+        estimate = dataclasses.replace(
+            estimate,
+            control_decomposition=config.control_decomposition,
+        )
+        interpreter.validate_no_internal_resource_symbols(estimate)
+        return estimate
 
-    def __str__(self) -> str:
-        """Pretty-print the resource estimate."""
-        lines = [
-            "Resource Estimate:",
-            f"  Qubits: {self.qubits}",
-            "  Gates:",
-            f"    Total: {self.gates.total}",
-            f"    Single-qubit: {self.gates.single_qubit}",
-            f"    Two-qubit: {self.gates.two_qubit}",
-            f"    Multi-qubit: {self.gates.multi_qubit}",
-            f"    T gates: {self.gates.t_gates}",
-            f"    Clifford gates: {self.gates.clifford_gates}",
-            f"    Rotation gates: {self.gates.rotation_gates}",
-        ]
-        if self.gates.oracle_calls:
-            lines.append("  Oracle Calls:")
-            for name, count in self.gates.oracle_calls.items():
-                lines.append(f"    {name}: {count}")
-        if self.gates.oracle_queries:
-            lines.append("  Oracle Queries:")
-            for name, count in self.gates.oracle_queries.items():
-                lines.append(f"    {name}: {count}")
-        if self.parameters:
-            lines.append("  Parameters:")
-            for name, symbol in self.parameters.items():
-                lines.append(f"    {name}: {symbol}")
-        return "\n".join(lines)
+    def _coerce_input(
+        self,
+        kernel: "QKernel[Any, Any] | Block | Sequence[Operation]",
+        build_inputs: dict[str, Any],
+        estimation_inputs: dict[str, Any],
+    ) -> Block | Sequence[Operation]:
+        """Coerce a supported input into an IR block or operation list.
+
+        Parameterizable inputs stay symbolic while non-parameterizable inputs
+        are supplied during tracing. This keeps problem sizes scalable without
+        requiring users to distinguish build-time from estimation-time inputs.
+
+        Args:
+            kernel (QKernel[Any, Any] | Block | Sequence[Operation]): Input
+                object.
+            build_inputs (dict[str, Any]): Structural values supplied while
+                tracing the qkernel.
+            estimation_inputs (dict[str, Any]): Parameterizable values kept
+                symbolic until after interpretation.
+
+        Returns:
+            Block | Sequence[Operation]: IR object ready for interpretation.
+
+        Raises:
+            TypeError: If a concrete build-time input cannot be converted to
+                its declared qkernel type.
+            ValueError: If a concrete build-time input violates its declared
+                domain or structural contract.
+        """
+        if isinstance(kernel, Block):
+            return kernel
+        if isinstance(kernel, Sequence):
+            return kernel
+        build = getattr(kernel, "build", None)
+        if callable(build):
+            parameters = _estimator_parameters(kernel, build_inputs)
+            try:
+                return build(parameters=parameters, **build_inputs)
+            except (TypeError, ValueError) as error:
+                names = ", ".join(repr(name) for name in sorted(build_inputs))
+                if not names:
+                    raise
+                raise type(error)(
+                    f"resource estimation could not bind input(s) {names}: {error}"
+                ) from error
+        block = getattr(kernel, "block", None)
+        if isinstance(block, Block):
+            return block
+        raise TypeError(
+            "ResourceEstimator.estimate() expects a QKernel, Block, or "
+            "sequence of Operation objects."
+        )
 
 
 def estimate_resources(
-    block: Block | list[Operation],
+    kernel: "QKernel[Any, Any] | Block | Sequence[Operation]",
     *,
-    bindings: dict[str, Any] | None = None,
+    inputs: dict[str, Any] | None = None,
+    strategies: dict[str, str] | None = None,
+    trace: bool = False,
+    unknown_policy: str | UnknownResourcePolicy = UnknownResourcePolicy.ERROR,
+    control_decomposition: str | ControlDecomposition = _DEFAULT_CONTROL_DECOMPOSITION,
 ) -> ResourceEstimate:
-    """Estimate all resources for a quantum circuit.
-
-    This is the main entry point for comprehensive resource estimation.
-    Combines qubit counting and gate counting.
+    """Estimate algorithmic resources using the default estimator facade.
 
     Args:
-        block: Block or list of Operations to analyze
-        bindings: Optional concrete parameter bindings (scalars and dicts).
+        kernel (QKernel[Any, Any] | Block | Sequence[Operation]): QKernel,
+            block, or operation sequence to estimate.
+        inputs (dict[str, Any] | None): QKernel input values used to specialize
+            the symbolic estimate without building a problem-sized circuit.
+            Exact one-dimensional root quantum-port widths declared by
+            callable resource metadata are inferred when omitted. Defaults to
+            ``None``.
+        strategies (dict[str, str] | None): Strategy overrides by callable
+            name. Defaults to ``None``.
+        trace (bool): Whether to retain the explanation tree. Defaults to
+            ``False``.
+        unknown_policy (str | UnknownResourcePolicy): Unknown callable
+            handling. Defaults to ``ERROR``.
+        control_decomposition (str | ControlDecomposition): Coherent-control
+            decomposition. Defaults to ``CLEAN_ANCILLA_TOFFOLI``.
 
     Returns:
-        ResourceEstimate with qubits, gates, and parameters
+        ResourceEstimate: Algorithmic resource estimate.
+
+    Raises:
+        RuntimeError: If a fixed or callback-provided opaque cost contains
+            public metrics or metadata that disagree with retained canonical
+            provenance.
+        ValueError: If the input specialization, estimator configuration,
+            callable resource contract, or structural requirements are invalid.
+        TypeError: If ``kernel`` is not a supported estimator input.
+        NotImplementedError: If the input IR contains a construct not
+            supported by resource estimation.
 
     Example:
-        >>> import qamomile.circuit as qm
-        >>> from qamomile.circuit.estimator import estimate_resources
-        >>>
-        >>> @qm.qkernel
-        >>> def bell_state() -> qm.Vector[qm.Qubit]:
-        ...     q = qm.qubit_array(2)
-        ...     q[0] = qm.h(q[0])
-        ...     q[0], q[1] = qm.cx(q[0], q[1])
+        >>> import qamomile.circuit as qmc
+        >>> @qmc.qkernel
+        ... def repeated_h(n: qmc.UInt) -> qmc.Qubit:
+        ...     q = qmc.qubit("q")
+        ...     for _ in qmc.range(n):
+        ...         q = qmc.h(q)
         ...     return q
-        >>>
-        >>> est = estimate_resources(bell_state.block)
-        >>> print(est.qubits)  # 2
-        >>> print(est.gates.total)  # 2
-        >>> print(est.gates.two_qubit)  # 1
-
-    Example with parametric size:
-        >>> @qm.qkernel
-        >>> def ghz_state(n: qm.UInt) -> qm.Vector[qm.Qubit]:
-        ...     q = qm.qubit_array(n)
-        ...     q[0] = qm.h(q[0])
-        ...     for i in qm.range(n - 1):
-        ...         q[i], q[i+1] = qm.cx(q[i], q[i+1])
-        ...     return q
-        >>>
-        >>> est = estimate_resources(ghz_state.block)
-        >>> print(est.qubits)  # n
-        >>> print(est.gates.total)  # n
-        >>> print(est.gates.two_qubit)  # n - 1
-        >>>
-        >>> # Substitute concrete value
-        >>> concrete = est.substitute(n=100)
-        >>> print(concrete.qubits)  # 100
-        >>> print(concrete.gates.total)  # 100
+        >>> symbolic = estimate_resources(repeated_h)
+        >>> str(symbolic.gates.total)
+        'n'
+        >>> estimate_resources(repeated_h, inputs={"n": 8}).gates.total
+        8
     """
-    # Count qubits
-    qubit_count = qubits_counter(block)
-
-    # Count gates
-    gate_count = count_gates(block)
-
-    # Substitute dict cardinality and scalar symbols if bindings provided
-    if bindings is not None:
-        # ``dict[Any, Any]`` — see the note in ``substitute`` above for
-        # why a narrower declaration would not type-check against
-        # ``sp.Expr.subs`` in sympy's stub.
-        all_subs: dict[Any, Any] = {}
-        for key, val in bindings.items():
-            if isinstance(val, dict):
-                all_subs[sp.Symbol(f"|{key}|", integer=True, positive=True)] = len(val)
-            elif isinstance(val, (int, float)):
-                all_subs[sp.Symbol(key, integer=True, positive=True)] = int(val)
-        if all_subs:
-            gate_count = GateCount(
-                total=gate_count.total.subs(all_subs),
-                single_qubit=gate_count.single_qubit.subs(all_subs),
-                two_qubit=gate_count.two_qubit.subs(all_subs),
-                multi_qubit=gate_count.multi_qubit.subs(all_subs),
-                t_gates=gate_count.t_gates.subs(all_subs),
-                clifford_gates=gate_count.clifford_gates.subs(all_subs),
-                rotation_gates=gate_count.rotation_gates.subs(all_subs),
-                oracle_calls={
-                    name: count.subs(all_subs)
-                    for name, count in gate_count.oracle_calls.items()
-                },
-                oracle_queries={
-                    name: count.subs(all_subs)
-                    for name, count in gate_count.oracle_queries.items()
-                },
-            )
-            qubit_count = qubit_count.subs(all_subs)
-
-    # Collect all symbols (parameters)
-    all_symbols: set[sp.Symbol] = set()
-    for expr in [
-        qubit_count,
-        gate_count.total,
-        gate_count.single_qubit,
-        gate_count.two_qubit,
-        gate_count.multi_qubit,
-        gate_count.t_gates,
-        gate_count.clifford_gates,
-        gate_count.rotation_gates,
-    ]:
-        all_symbols.update(expr.free_symbols)  # type: ignore[arg-type]
-    for oracle_expr in gate_count.oracle_calls.values():
-        all_symbols.update(oracle_expr.free_symbols)  # type: ignore[arg-type]
-    for oracle_expr in gate_count.oracle_queries.values():
-        all_symbols.update(oracle_expr.free_symbols)  # type: ignore[arg-type]
-
-    parameters = {str(sym): sym for sym in sorted(all_symbols, key=str)}
-
-    return ResourceEstimate(
-        qubits=qubit_count,
-        gates=gate_count,
-        parameters=parameters,
+    estimator = ResourceEstimator(
+        strategies=strategies,
+        trace=trace,
+        unknown_policy=unknown_policy,
+        control_decomposition=control_decomposition,
+    )
+    return estimator.estimate(
+        kernel,
+        inputs=inputs,
     )

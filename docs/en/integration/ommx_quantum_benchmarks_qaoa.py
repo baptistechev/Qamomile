@@ -17,7 +17,7 @@
 # tags: [integration, optimization, variational]
 # ---
 #
-# # Using OMMX Quantum Benchmarks (1): Implementing and Benchmarking Quantum Algorithms with Qamomile
+# # Using OMMX Quantum Benchmarks: Implementing and Benchmarking Quantum Algorithms with Qamomile
 #
 # This tutorial shows how to run a Qamomile quantum algorithm on a problem
 # from a public benchmark dataset and compare its solution quality with a
@@ -34,7 +34,7 @@
 
 # %%
 # Install the additional packages used in this tutorial.
-# # !pip install qamomile ommx-quantum-benchmarks ommx-pyscipopt-adapter
+# # !pip install "qamomile[qiskit]" ommx-quantum-benchmarks ommx-pyscipopt-adapter
 
 # %%
 import os
@@ -328,7 +328,7 @@ executor = QiskitExecutor(
 )
 
 docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-maxiter = 5 if docs_test_mode else 50
+maxiter = 1 if docs_test_mode else 50
 
 rng = np.random.default_rng(SEED)
 initial_params = rng.uniform(0, np.pi, 2 * p)
@@ -406,7 +406,7 @@ def evaluate_with_ommx(
 
 gammas_opt = list(res.x[:p])
 betas_opt = list(res.x[p:])
-final_shots = 256 if docs_test_mode else 4096
+final_shots = 1 if docs_test_mode else 4096
 
 final_result = sampling_executable.sample(
     executor,
@@ -536,5 +536,5 @@ print(f"QAOA hit rate on E* = {ref_E}: {hit_rate:.1%}  ({final_shots} shots)")
 # QUBO via `Instance.to_qubo()`, and reuse the same `BinaryModel` +
 # QAOA ansatz + transpile loop. Larger instances will
 # eventually outgrow local simulators, at which point the same
-# `executable` can be re-targeted to other Qamomile backends
+# `executable` can be re-targeted to other Qamomile quantum SDK integrations
 # (`QuriPartsTranspiler`, `CudaqTranspiler`, …) or real hardware.

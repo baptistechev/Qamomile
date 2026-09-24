@@ -40,16 +40,23 @@ def pauli_evolve(
     Implements Hamiltonian time evolution using the Pauli gadget technique.
     The actual Hamiltonian is provided via bindings at transpile time.
 
-    Each backend can use native implementations:
+    Each engine can use native implementations:
     - Qiskit: PauliEvolutionGate
     - QuriParts: PauliRotation gates
     - Others: fallback decomposition (basis change + CNOT ladder + RZ)
 
     Args:
-        q: The quantum register to evolve.
-        hamiltonian: Observable parameter referencing the Hamiltonian.
-            The actual qamomile.observable.Hamiltonian is provided via bindings.
-        gamma: Evolution time / variational parameter.
+        q (Vector[Qubit] | VectorView[Qubit]): The quantum register to
+            evolve. It may have more qubits than the Hamiltonian acts on:
+            each Pauli term addresses register elements positionally
+            (``PauliOperator.index`` ``i`` acts on ``q[i]``), and qubits
+            beyond ``hamiltonian.num_qubits`` evolve under the identity.
+        hamiltonian (Observable): Observable parameter referencing the
+            Hamiltonian. The actual ``qamomile.observable.Hamiltonian`` is
+            provided via bindings. A Hamiltonian acting on more qubits
+            than ``q`` provides fails with ``EmitError`` at transpile
+            time.
+        gamma (Float): Evolution time / variational parameter.
 
     Returns:
         Vector[Qubit]: The evolved qubit register.

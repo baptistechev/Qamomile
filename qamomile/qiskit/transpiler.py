@@ -1,4 +1,4 @@
-"""Qiskit backend transpiler implementation.
+"""Qiskit engine transpiler implementation.
 
 This module provides QiskitTranspiler for converting Qamomile QKernels
 into Qiskit QuantumCircuits.
@@ -10,635 +10,177 @@ from typing import TYPE_CHECKING, Any, Sequence, cast
 
 if TYPE_CHECKING:
     import qamomile.observable as qm_o
-    from qamomile.circuit.ir.operation.pauli_evolve import PauliEvolveOp
     from qiskit import QuantumCircuit
 
-from qamomile.circuit.ir.operation.arithmetic_operations import (
-    CompOp,
-    CompOpKind,
-    CondOp,
-    CondOpKind,
-    NotOp,
-    RuntimeClassicalExpr,
-    RuntimeOpKind,
+from qamomile.circuit.transpiler.circuit_ir import (
+    CircuitEngineEmitPass,
+    CompilationPolicy,
 )
-from qamomile.circuit.ir.operation.control_flow import (
-    ForOperation,
-    IfOperation,
-    WhileOperation,
-)
-from qamomile.circuit.ir.value import Value
-from qamomile.circuit.transpiler.errors import EmitError
 from qamomile.circuit.transpiler.executable import (
     ParameterMetadata,
     QuantumExecutor,
 )
-from qamomile.circuit.transpiler.passes.emit import EmitPass
-from qamomile.circuit.transpiler.passes.emit_support import (
-    ClbitMap,
-    QubitAddress,
-    QubitMap,
-    resolve_condition_address,
-    resolve_if_condition,
+from qamomile.circuit.transpiler.execution_capability import ExecutionCapabilities
+from qamomile.circuit.transpiler.execution_handle import (
+    ExecutionHandle,
+    ExecutionReference,
 )
+from qamomile.circuit.transpiler.execution_request import EstimateRequest, SampleRequest
+from qamomile.circuit.transpiler.passes.emit import EmitPass
 from qamomile.circuit.transpiler.passes.separate import SegmentationPass
-from qamomile.circuit.transpiler.passes.standard_emit import StandardEmitPass
 from qamomile.circuit.transpiler.transpiler import Transpiler
-from qamomile.qiskit.emitter import QiskitGateEmitter
-
-
-class QiskitEmitPass(StandardEmitPass["QuantumCircuit"]):
-    """Qiskit-specific emission pass.
-
-    Extends StandardEmitPass with Qiskit-specific control flow handling
-    using context managers.
-    """
-
-    def __init__(
-        self,
-        bindings: dict[str, Any] | None = None,
-        parameters: list[str] | None = None,
-        use_native_composite: bool = True,
-    ):
-        """Initialize the Qiskit emit pass.
-
-        Args:
-            bindings: Parameter bindings for the circuit
-            parameters: List of parameter names to preserve as backend parameters
-            use_native_composite: If True, use native Qiskit implementations
-                                  for QFT/IQFT. If False, use manual decomposition.
-        """
-        emitter = QiskitGateEmitter()
-        composite_emitters = self._init_emitters() if use_native_composite else []
-        super().__init__(emitter, bindings, parameters, composite_emitters)
-        self._use_native_composite = use_native_composite
-
-    def _init_emitters(self) -> list:
-        """Initialize native CompositeGate emitters."""
-        from qamomile.qiskit.emitters import QiskitQFTEmitter
-
-        return [QiskitQFTEmitter()]
-
-    def _emit_for(
-        self,
-        circuit: "QuantumCircuit",
-        op: ForOperation,
-        qubit_map: QubitMap,
-        clbit_map: ClbitMap,
-        bindings: dict[str, Any],
-        force_unroll: bool = False,
-    ) -> None:
-        """Emit a for loop using Qiskit's native for_loop context manager."""
-        from qamomile.circuit.transpiler.passes.emit_support.control_flow_emission import (
-            resolve_loop_bounds,
-        )
-
-        start, stop, step = resolve_loop_bounds(self._resolver, op, bindings)
-
-        if start is None or stop is None or step is None:
-            self._emit_for_unrolled(circuit, op, qubit_map, clbit_map, bindings)
-            return
-
-        indexset = range(start, stop, step)
-        if len(indexset) == 0:
-            return
-
-        if force_unroll:
-            self._emit_for_unrolled(circuit, op, qubit_map, clbit_map, bindings)
-            return
-
-        if self._loop_analyzer.should_unroll(op, bindings):
-            self._emit_for_unrolled(circuit, op, qubit_map, clbit_map, bindings)
-            return
-
-        # Use Qiskit's native for_loop context manager
-        with circuit.for_loop(indexset) as loop_param:  # type: ignore[call-overload]
-            loop_bindings = bindings.copy()
-            from qamomile.circuit.transpiler.passes.emit_support.control_flow_emission import (
-                _bind_loop_var,
-            )
-
-            _bind_loop_var(loop_bindings, op, loop_param)
-            self._emit_operations(
-                circuit, op.operations, qubit_map, clbit_map, loop_bindings
-            )
-
-    def _emit_if(
-        self,
-        circuit: "QuantumCircuit",
-        op: IfOperation,
-        qubit_map: QubitMap,
-        clbit_map: ClbitMap,
-        bindings: dict[str, Any],
-    ) -> None:
-        """Emit if/else using Qiskit's if_test context manager."""
-        condition = op.condition
-
-        # Compile-time constant conditions are handled by the base class.
-        if resolve_if_condition(condition, bindings) is not None:
-            super()._emit_if(circuit, op, qubit_map, clbit_map, bindings)
-            return
-
-        if_test_condition = self._resolve_runtime_condition(
-            circuit, condition, clbit_map, bindings
-        )
-
-        with circuit.if_test(if_test_condition) as else_:
-            self._emit_operations(
-                circuit, op.true_operations, qubit_map, clbit_map, bindings
-            )
-        with else_:
-            self._emit_operations(
-                circuit, op.false_operations, qubit_map, clbit_map, bindings
-            )
-
-    def _emit_while(
-        self,
-        circuit: "QuantumCircuit",
-        op: WhileOperation,
-        qubit_map: QubitMap,
-        clbit_map: ClbitMap,
-        bindings: dict[str, Any],
-    ) -> None:
-        """Emit while loop using Qiskit's while_loop context manager."""
-        if not op.operands:
-            raise EmitError(
-                "WhileOperation requires a condition operand.",
-                operation="WhileOperation",
-            )
-
-        condition = op.operands[0]
-        condition_value = condition.value if hasattr(condition, "value") else condition
-        while_condition = self._resolve_runtime_condition(
-            circuit, condition_value, clbit_map, bindings
-        )
-
-        with circuit.while_loop(while_condition):  # type: ignore[call-overload]
-            self._emit_operations(
-                circuit, op.operations, qubit_map, clbit_map, bindings
-            )
-
-    def _resolve_runtime_condition(
-        self,
-        circuit: "QuantumCircuit",
-        condition: Any,
-        clbit_map: ClbitMap,
-        bindings: dict[str, Any],
-    ) -> Any:
-        """Resolve a runtime if/while condition to a Qiskit ``if_test`` argument.
-
-        The returned value is suitable for passing to
-        ``QuantumCircuit.if_test`` / ``while_loop``: either a
-        ``(clbit, value)`` tuple for a single-bit measurement condition, or
-        a ``qiskit.circuit.classical.expr.Expr`` for a compound predicate
-        (``CondOp`` / ``NotOp`` / ``CompOp`` over measurement bits)
-        previously stored in ``bindings`` by ``_build_runtime_predicate_expr``.
-
-        Args:
-            circuit: The Qiskit circuit being emitted (for clbit lookup).
-            condition: The IR condition Value.
-            clbit_map: Map from ``QubitAddress`` to physical clbit index.
-            bindings: Current bindings; may hold a backend ``Expr`` keyed by
-                the condition's UUID.
-
-        Returns:
-            A condition object accepted by ``if_test`` / ``while_loop``.
-
-        Raises:
-            EmitError: If the condition is neither a measurement clbit nor a
-                stored runtime expression.
-        """
-        condition_uuid = (
-            condition.uuid if hasattr(condition, "uuid") else str(condition)
-        )
-
-        # Compound predicate built earlier by _build_runtime_predicate_expr.
-        stored = bindings.get(condition_uuid)
-        if stored is not None and not isinstance(stored, (bool, int, float)):
-            return stored
-
-        if isinstance(condition, Value):
-            condition_addr = resolve_condition_address(
-                condition, bindings, self._resolver
-            )
-        else:
-            condition_addr = QubitAddress(condition_uuid)
-        if condition_addr in clbit_map:
-            clbit_idx = clbit_map[condition_addr]
-            return (circuit.clbits[clbit_idx], 1)
-
-        raise EmitError(
-            "Runtime control-flow conditions (if / while) must come from "
-            "measurement results or be bound before transpilation. The "
-            "condition value was neither resolved at compile time nor "
-            "backed by a measurement result."
-        )
-
-    def _emit_runtime_classical_expr(
-        self,
-        circuit: "QuantumCircuit",
-        op: RuntimeClassicalExpr,
-        clbit_map: ClbitMap,
-        bindings: dict[str, Any],
-    ) -> None:
-        """Lower ``RuntimeClassicalExpr`` to a Qiskit ``expr.Expr``.
-
-        Counterpart of (and supersedes for the runtime path) the legacy
-        ``_build_runtime_predicate_expr``. The IR has already declared
-        this op runtime via ``ClassicalLoweringPass``, so we go straight
-        to expression construction without a fold attempt.
-
-        Args:
-            circuit: The Qiskit circuit being emitted.
-            op: The runtime classical expression to lower.
-            clbit_map: Map from ``QubitAddress`` → physical clbit index.
-            bindings: Current bindings; result is stored here.
-
-        Raises:
-            EmitError: If an operand cannot be resolved to a clbit /
-                sub-expression / constant — meaning the IR is malformed
-                or the lowering pass missed a case.
-        """
-        from qamomile.circuit.transpiler.errors import EmitError
-        from qiskit.circuit.classical import expr
-
-        # Typed-slot lookups when bindings is an EmitContext; fall back to
-        # flat-dict access for legacy plain-dict callers (compat shim).
-        get_runtime_expr = getattr(bindings, "get_runtime_expr", None)
-        get_loop_var = getattr(bindings, "get_loop_var", None)
-        params_slot = getattr(bindings, "_params", None)
-
-        def resolve_operand(v: Any) -> Any:
-            """Resolve an operand to a Qiskit ``Expr`` / ``Clbit`` / Python literal.
-
-            Identity policy:
-              1. Backend ``expr.Expr`` from a prior ``RuntimeClassicalExpr``:
-                 read from the ``runtime_exprs`` typed slot via UUID.
-              2. Constants: ``v.get_const()`` returns the IR-typed value
-                 (Bit→bool, UInt→int, Float→float). No ``bool(...)``
-                 coercion — that would clobber numeric arithmetic.
-              3. Clbit references: ``resolve_condition_address(v, ...)``
-                 keyed lookup in ``clbit_map`` — a scalar bit resolves to
-                 ``QubitAddress(v.uuid)`` while a measured ``Vector[Bit]``
-                 element resolves to ``QubitAddress(root_array.uuid,
-                 root_index)`` (walking ``parent_array`` / ``slice_of``).
-              4. User parameters: read from the ``parameters`` typed slot
-                 by parameter name (the only legitimate name path).
-              5. Loop variables: read from the ``loop_vars`` typed slot
-                 via UUID (preserved through inline by the all_input_values
-                 / replace_values protocol).
-
-            No name fallback — every step keys on UUID or an explicit
-            ``is_parameter()`` flag, never on display names.
-            """
-            if not hasattr(v, "uuid"):
-                return None
-
-            # 1. Backend expr already built for this Value (UUID-keyed).
-            if callable(get_runtime_expr):
-                expr_obj = get_runtime_expr(v.uuid)
-                if expr_obj is not None:
-                    return expr_obj
-            else:
-                stored = bindings.get(v.uuid) if hasattr(bindings, "get") else None
-                if stored is not None and not isinstance(stored, (bool, int, float)):
-                    return stored
-
-            # 2. Constant — preserve IR type.
-            if hasattr(v, "is_constant") and v.is_constant():
-                return v.get_const()
-
-            # 3. Clbit reference. ``Vector[Bit]`` element accesses route
-            #    through ``QubitAddress(parent_array.uuid, index)``; scalar
-            #    bits use ``QubitAddress(v.uuid)``.
-            addr = resolve_condition_address(v, bindings, self._resolver)
-            if addr in clbit_map:
-                return circuit.clbits[clbit_map[addr]]
-
-            # 4. User parameter (name-keyed by definition; surface from
-            #    typed slot when available).
-            if hasattr(v, "is_parameter") and v.is_parameter():
-                pname = v.parameter_name()
-                if pname:
-                    if params_slot is not None and pname in params_slot:
-                        return params_slot[pname]
-                    if hasattr(bindings, "get"):
-                        bound = bindings.get(pname)
-                        if bound is not None:
-                            return bound
-
-            # 5. Loop variable (UUID-keyed).
-            if callable(get_loop_var):
-                lv = get_loop_var(v.uuid)
-                if lv is not None:
-                    return lv
-
-            # 6. Legacy compat shim: plain-dict caller, scalar binding.
-            if hasattr(bindings, "get"):
-                stored = bindings.get(v.uuid)
-                if isinstance(stored, (bool, int, float)):
-                    return stored
-
-            return None
-
-        kind = op.kind
-        if kind is RuntimeOpKind.NOT:
-            inner = resolve_operand(op.operands[0])
-            if inner is None:
-                raise EmitError(
-                    f"Cannot resolve operand for RuntimeClassicalExpr(NOT): "
-                    f"{op.operands[0]!r}"
-                )
-            result = expr.logic_not(inner)
-        else:
-            assert kind is not None
-            lhs = resolve_operand(op.operands[0])
-            rhs = resolve_operand(op.operands[1])
-            if lhs is None or rhs is None:
-                raise EmitError(
-                    f"Cannot resolve operands for RuntimeClassicalExpr({kind!r})"
-                )
-            result = self._build_qiskit_binary_expr(kind, lhs, rhs)
-            if result is None:
-                raise EmitError(
-                    f"Unsupported RuntimeClassicalExpr kind for Qiskit backend: {kind}"
-                )
-
-        # Store result so downstream ``_emit_if`` / ``_emit_while`` /
-        # nested ``RuntimeClassicalExpr`` can consume it.
-        set_runtime_expr = getattr(bindings, "set_runtime_expr", None)
-        if callable(set_runtime_expr):
-            set_runtime_expr(op.results[0].uuid, result)
-        else:
-            bindings[op.results[0].uuid] = result
-
-    @staticmethod
-    def _build_qiskit_binary_expr(kind: RuntimeOpKind, lhs: Any, rhs: Any) -> Any:
-        """Map a binary ``RuntimeOpKind`` to its Qiskit ``expr`` constructor.
-
-        Every arm of ``RuntimeOpKind`` (except ``NOT``, which is handled
-        upstream) is dispatched here. Kinds without a Qiskit ``expr``
-        equivalent — currently ``FLOORDIV`` and ``POW`` — raise
-        ``NotImplementedError`` rather than silently returning ``None``,
-        so the contract gap is loud at emit time instead of producing a
-        misleading "Unsupported kind" error.
-        """
-        from qiskit.circuit.classical import expr
-
-        match kind:
-            # Logical
-            case RuntimeOpKind.AND:
-                return expr.logic_and(lhs, rhs)
-            case RuntimeOpKind.OR:
-                return expr.logic_or(lhs, rhs)
-            # Comparison
-            case RuntimeOpKind.EQ:
-                return expr.equal(lhs, rhs)
-            case RuntimeOpKind.NEQ:
-                return expr.not_equal(lhs, rhs)
-            case RuntimeOpKind.LT:
-                return expr.less(lhs, rhs)
-            case RuntimeOpKind.LE:
-                return expr.less_equal(lhs, rhs)
-            case RuntimeOpKind.GT:
-                return expr.greater(lhs, rhs)
-            case RuntimeOpKind.GE:
-                return expr.greater_equal(lhs, rhs)
-            # Arithmetic
-            case RuntimeOpKind.ADD:
-                return expr.add(lhs, rhs)
-            case RuntimeOpKind.SUB:
-                return expr.sub(lhs, rhs)
-            case RuntimeOpKind.MUL:
-                return expr.mul(lhs, rhs)
-            case RuntimeOpKind.DIV:
-                return expr.div(lhs, rhs)
-            case RuntimeOpKind.FLOORDIV | RuntimeOpKind.POW:
-                raise NotImplementedError(
-                    f"RuntimeOpKind.{kind.name} is not supported by the Qiskit "
-                    f"backend (Qiskit's classical expr has no equivalent). "
-                    f"If you need this kind, fold it at compile time before "
-                    f"the runtime classical-lowering pass."
-                )
-            case _:
-                raise NotImplementedError(
-                    f"Unhandled RuntimeOpKind in _build_qiskit_binary_expr: {kind!r}"
-                )
-
-    def _build_runtime_predicate_expr(
-        self,
-        circuit: "QuantumCircuit",
-        op: "CompOp | CondOp | NotOp",
-        clbit_map: ClbitMap,
-        bindings: dict[str, Any],
-    ) -> Any:
-        """Build a Qiskit ``expr.Expr`` for an unlowered runtime predicate.
-
-        Fallback path used by ``StandardEmitPass`` only when a
-        ``CompOp``/``CondOp``/``NotOp`` reaches emit without having been
-        rewritten to ``RuntimeClassicalExpr`` by ``ClassicalLoweringPass``
-        — i.e., predicates that depend on emit-time-bound values not
-        visible to the pre-emit lowering pass (e.g. computed from a loop
-        variable that wraps a measurement). The primary path is
-        ``_emit_runtime_classical_expr``; prefer extending the lowering
-        pass over adding new cases here.
-
-        Recursively resolves operands to either Qiskit ``Clbit`` references
-        (via ``clbit_map``), constants, or already-built sub-expressions
-        stored in ``bindings``. Returns ``None`` when any operand cannot be
-        resolved — the caller leaves the predicate unbound, and the
-        downstream ``if`` / ``while`` falls back to its (failing) clbit
-        lookup, which raises a clear ``EmitError``.
-
-        Supported ops:
-            * ``CondOp(AND/OR)`` → ``expr.logic_and`` / ``expr.logic_or``
-            * ``NotOp`` → ``expr.logic_not``
-            * ``CompOp(EQ/NEQ)`` over Bit operands → ``expr.equal`` /
-              ``expr.not_equal``
-
-        Args:
-            circuit: The Qiskit circuit being emitted (for clbit lookup).
-            op: The unresolved classical predicate.
-            clbit_map: Map from ``QubitAddress`` → physical clbit index.
-            bindings: Current bindings; may hold sub-expression results
-                keyed by Value UUIDs.
-
-        Returns:
-            A ``qiskit.circuit.classical.expr.Expr`` object, or ``None`` if
-            the predicate cannot be expressed.
-        """
-        from qiskit.circuit.classical import expr
-
-        def resolve_operand(v: Any) -> Any:
-            """Operand → Qiskit ``Expr`` / ``Clbit`` / Python literal, or None."""
-            if hasattr(v, "uuid"):
-                stored_v = bindings.get(v.uuid)
-                if stored_v is not None and not isinstance(stored_v, (bool, int)):
-                    return stored_v
-                if hasattr(v, "is_constant") and v.is_constant():
-                    return bool(v.get_const())
-                addr = (
-                    resolve_condition_address(v, bindings, self._resolver)
-                    if isinstance(v, Value)
-                    else QubitAddress(v.uuid)
-                )
-                if addr in clbit_map:
-                    return circuit.clbits[clbit_map[addr]]
-                if isinstance(stored_v, (bool, int)):
-                    return bool(stored_v)
-            return None
-
-        if isinstance(op, NotOp):
-            inner = resolve_operand(op.operands[0])
-            if inner is None:
-                return None
-            return expr.logic_not(inner)
-
-        lhs = resolve_operand(op.operands[0])
-        rhs = resolve_operand(op.operands[1])
-        if lhs is None or rhs is None:
-            return None
-
-        if isinstance(op, CondOp):
-            if op.kind is CondOpKind.AND:
-                return expr.logic_and(lhs, rhs)
-            if op.kind is CondOpKind.OR:
-                return expr.logic_or(lhs, rhs)
-            return None
-
-        if isinstance(op, CompOp):
-            if op.kind is CompOpKind.EQ:
-                return expr.equal(lhs, rhs)
-            if op.kind is CompOpKind.NEQ:
-                return expr.not_equal(lhs, rhs)
-            return None
-
-        return None  # type: ignore[unreachable]
-
-    def _emit_pauli_evolve(
-        self,
-        circuit: "QuantumCircuit",
-        op: "PauliEvolveOp",
-        qubit_map: QubitMap,
-        bindings: dict[str, Any],
-    ) -> None:
-        """Emit Pauli evolution using Qiskit's PauliEvolutionGate."""
-        import qamomile.observable as qm_o
-
-        if not self._use_native_composite:
-            super()._emit_pauli_evolve(circuit, op, qubit_map, bindings)
-            return
-
-        # Resolve Hamiltonian from bindings
-        obs_value = op.observable
-        hamiltonian = None
-        if hasattr(obs_value, "name") and obs_value.name in bindings:
-            hamiltonian = bindings[obs_value.name]
-        if hamiltonian is None and hasattr(obs_value, "uuid"):
-            hamiltonian = bindings.get(obs_value.uuid)
-        if not isinstance(hamiltonian, qm_o.Hamiltonian):
-            super()._emit_pauli_evolve(circuit, op, qubit_map, bindings)
-            return
-
-        # Resolve gamma: concrete float OR backend Parameter for parametric
-        # gamma (scalar / array element). Qiskit's PauliEvolutionGate accepts
-        # a Parameter (or ParameterExpression) as ``time``.
-        from qamomile.circuit.transpiler.passes.emit_support.pauli_evolve_emission import (
-            _resolve_gamma,
-        )
-
-        gamma = _resolve_gamma(self, op, bindings)
-        if gamma is None:
-            super()._emit_pauli_evolve(circuit, op, qubit_map, bindings)
-            return
-
-        # Validate qubit count: logical array size vs Hamiltonian
-        input_array = op.qubits
-        num_h_qubits = hamiltonian.num_qubits
-        from qamomile.circuit.ir.value import ArrayValue
-
-        if isinstance(input_array, ArrayValue) and input_array.shape:
-            n_resolved = self._resolver.resolve_int_value(
-                input_array.shape[0], bindings
-            )
-            if n_resolved is not None and n_resolved != num_h_qubits:
-                raise EmitError(
-                    f"PauliEvolveOp qubit count mismatch: "
-                    f"qubit register has {n_resolved} qubits but "
-                    f"Hamiltonian acts on {num_h_qubits} qubits.",
-                )
-
-        # Validate Hermitian (real coefficients)
-        for operators, coeff in hamiltonian:
-            if abs(coeff.imag) > 1e-10:
-                raise EmitError(
-                    f"PauliEvolveOp requires a Hermitian Hamiltonian "
-                    f"(real coefficients), but found complex coefficient "
-                    f"{coeff} on term {operators}.",
-                )
-
-        qubit_indices: list[int] = []
-        for i in range(num_h_qubits):
-            addr = QubitAddress(input_array.uuid, i)
-            if addr in qubit_map:
-                qubit_indices.append(qubit_map[addr])
-            else:
-                super()._emit_pauli_evolve(circuit, op, qubit_map, bindings)
-                return
-
-        try:
-            from qamomile.qiskit.observable import hamiltonian_to_sparse_pauli_op
-            from qiskit.circuit.library import PauliEvolutionGate
-
-            sparse_op = hamiltonian_to_sparse_pauli_op(hamiltonian)
-            # ``time`` accepts both ``float`` and Qiskit ``Parameter`` /
-            # ``ParameterExpression``. For parametric gamma we pass the
-            # backend parameter through so it can be bound at run-time.
-            time_arg = float(gamma) if isinstance(gamma, (int, float)) else gamma
-            evo_gate = PauliEvolutionGate(sparse_op, time=time_arg)
-            circuit.append(evo_gate, qubit_indices)
-        except ImportError:
-            # Fallback to manual decomposition when Qiskit library unavailable
-            super()._emit_pauli_evolve(circuit, op, qubit_map, bindings)
-            return
-
-        # Map result array to same physical qubits
-        result_array = op.evolved_qubits
-        for i, phys_idx in enumerate(qubit_indices):
-            result_addr = QubitAddress(result_array.uuid, i)
-            if result_addr not in qubit_map:
-                qubit_map[result_addr] = phys_idx
+from qamomile.qiskit.execution import QiskitExecutionOptions
+from qamomile.qiskit.materializer import QiskitMaterializer
+from qamomile.qiskit.runtime import _RuntimeExecutor
 
 
 class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
-    """Qiskit quantum executor using a safe local simulator or other backends.
+    """Execute Qiskit circuits locally or on a selected IBM Quantum backend.
+
+    With no backend, use AerSimulator or BasicSimulator. Named backends are
+    resolved through QiskitRuntimeService using the supplied credentials or
+    the SDK's saved account. IBMBackend objects select Runtime automatically.
+    Credentials are passed to the SDK without saving an account to disk.
+
+    Args:
+        backend (Any): Qiskit backend object, IBM backend name, or ``None``
+            for the default local simulator.
+        estimator (Any): Optional local expectation estimator. Defaults to
+            ``None`` for StatevectorEstimator; unavailable with Runtime.
+        api_key (str | None): IBM API key for a named backend. Must be supplied
+            with ``instance_crn``. Defaults to the SDK's saved account.
+        instance_crn (str | None): IBM instance CRN paired with ``api_key``.
+            Defaults to the SDK's configured instance.
+        mode (Any): Caller-owned Runtime Session or Batch paired with a backend
+            object. A backend object can also select Runtime local testing mode.
+            Defaults to None; unavailable with a backend name.
+        options (QiskitExecutionOptions | None): Qamomile-owned Runtime settings.
+            Defaults to None; cannot be combined with ``sampler_options`` or
+            ``estimator_options``.
+        sampler_options (Any): Runtime sampler options. Defaults to None.
+        estimator_options (Any): Runtime estimator options. Defaults to None.
+        pass_manager (Any): Runtime target pass manager. Defaults to None.
+        service (Any): Existing Runtime service for named backend lookup or
+            job restoration. Cannot be combined with explicit credentials.
+
+    Raises:
+        TypeError: If ``options`` is not a QiskitExecutionOptions instance.
+        ValueError: If credentials are incomplete, arguments conflict, or
+            Runtime options are supplied for local execution.
+        ImportError: If IBM execution is requested without its SDK extra.
+        QiskitBackendNotFoundError: If the named backend cannot be found for
+            the selected account and instance.
+        Exception: If SDK authentication, lookup, or setup fails.
 
     Example:
         executor = QiskitExecutor()  # Uses AerSimulator when available
         counts = executor.execute(circuit, shots=1000)
-        # counts: {"00": 512, "11": 512}
-
-        # With expectation value estimation
-        from qamomile.qiskit.observable import QiskitExpectationEstimator
-        executor = QiskitExecutor(estimator=QiskitExpectationEstimator())
-        exp_val = executor.estimate(circuit, observable)
+        executor = QiskitExecutor(
+            backend="your_backend_name",
+            api_key=api_key,
+            instance_crn=instance_crn,
+        )
+        job = executable.sample(executor, shots=1024)
     """
 
-    def __init__(self, backend=None, estimator=None):
-        """Initialize executor with backend and optional estimator.
+    def __init__(
+        self,
+        backend: Any = None,
+        estimator: Any = None,
+        *,
+        api_key: str | None = None,
+        instance_crn: str | None = None,
+        mode: Any = None,
+        options: QiskitExecutionOptions | None = None,
+        sampler_options: Any = None,
+        estimator_options: Any = None,
+        pass_manager: Any = None,
+        service: Any = None,
+    ) -> None:
+        """Select local execution or authenticate a named IBM backend.
 
         Args:
-            backend: Qiskit backend (defaults to AerSimulator if available)
-            estimator: Optional QiskitExpectationEstimator for expectation values
+            backend (Any): Qiskit backend object or IBM device name. Defaults
+                to a local simulator when None.
+            estimator (Any): Local expectation estimator, or None for defaults.
+            api_key (str | None): IBM API key, paired with ``instance_crn``
+                for a named backend. Defaults to None for the saved account.
+            instance_crn (str | None): IBM instance CRN paired with ``api_key``.
+                Defaults to None for the SDK's configured instance.
+            mode (Any): Runtime Session, Batch, or local testing backend paired
+                with a backend object. Defaults to None; not used with a name.
+            options (QiskitExecutionOptions | None): Qamomile-owned Runtime
+                settings. Defaults to None; cannot be combined with direct
+                sampler or estimator options.
+            sampler_options (Any): Runtime sampler options, or None.
+            estimator_options (Any): Runtime estimator options, or None.
+            pass_manager (Any): Runtime hardware compilation pass manager,
+                or None for the preset at optimization level one.
+            service (Any): Existing Runtime service for lookup or restoration,
+                or None. Cannot be combined with explicit credentials.
+
+        Raises:
+            TypeError: If ``options`` is not a QiskitExecutionOptions instance.
+            ValueError: If credentials are incomplete, arguments conflict, or
+                Runtime options are supplied for local execution.
+            ImportError: If IBM execution is requested without its SDK extra.
+            QiskitBackendNotFoundError: If the named backend cannot be found
+                for the selected account and instance.
+            Exception: If SDK authentication, lookup, or setup fails.
         """
+        if options is not None:
+            if not isinstance(options, QiskitExecutionOptions):
+                raise TypeError("options must be a QiskitExecutionOptions instance")
+            if sampler_options is not None or estimator_options is not None:
+                raise ValueError(
+                    "options cannot be combined with sampler_options or estimator_options"
+                )
+            sampler_options = options.sampler_kwargs()
+            estimator_options = options.estimator_kwargs()
+        _validate_runtime_credentials(backend, api_key, instance_crn, service)
+        named_backend = isinstance(backend, str)
+        if named_backend:
+            if mode is not None:
+                raise ValueError("Use a backend object with a Runtime mode")
+            if estimator is not None:
+                raise ValueError("Use estimator_options with an IBM Runtime backend")
+            backend, service = _resolve_ibm_backend(
+                backend, api_key, instance_crn, service
+            )
+        runtime_requested = (
+            named_backend or mode is not None or _is_ibm_backend(backend)
+        )
+        runtime_options = (sampler_options, estimator_options, pass_manager, service)
+        if not runtime_requested and any(
+            option is not None for option in runtime_options
+        ):
+            raise ValueError(
+                "Runtime options require an IBM backend or an explicit mode"
+            )
+        if mode is not None and backend is None:
+            raise ValueError("A Runtime mode requires an explicit backend")
+        if runtime_requested and estimator is not None:
+            raise ValueError("Use estimator_options with an IBM Runtime backend")
         self.backend = backend
         self._estimator = estimator
+        self._runtime = (
+            _RuntimeExecutor(
+                backend,
+                mode=mode,
+                sampler_options=sampler_options,
+                estimator_options=estimator_options,
+                pass_manager=pass_manager,
+                service=service,
+            )
+            if runtime_requested
+            else None
+        )
 
         if self.backend is None:
             try:
                 from qiskit_aer import AerSimulator
 
-                self.backend = AerSimulator(max_parallel_threads=1)
+                self.backend = AerSimulator()
             except ImportError:
                 try:
                     from qiskit.providers.basic_provider import BasicSimulator
@@ -647,16 +189,98 @@ class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
                 except ImportError:
                     pass
 
+    @property
+    def capabilities(self) -> ExecutionCapabilities:
+        """Describe execution features of the selected local or IBM backend.
+
+        Returns:
+            ExecutionCapabilities: Selected adapter's lifecycle and accuracy
+                support, preserving local executor defaults.
+        """
+        if self._runtime is not None:
+            return self._runtime.capabilities
+        return super().capabilities
+
+    def submit_sample(
+        self, request: SampleRequest[QuantumCircuit]
+    ) -> ExecutionHandle[dict[str, int]]:
+        """Submit samples through the selected execution adapter.
+
+        Args:
+            request (SampleRequest[QuantumCircuit]): Circuit, bindings, and shots.
+
+        Returns:
+            ExecutionHandle[dict[str, int]]: Immediate local result or lazy IBM
+                job handle.
+
+        Raises:
+            Exception: If request validation, compilation, or submission fails.
+        """
+        if self._runtime is not None:
+            return self._runtime.submit_sample(request)
+        return super().submit_sample(request)
+
+    def submit_estimate(
+        self, request: EstimateRequest[QuantumCircuit]
+    ) -> ExecutionHandle[float]:
+        """Submit an expectation through the selected execution adapter.
+
+        Args:
+            request (EstimateRequest[QuantumCircuit]): Circuit, observable,
+                and optional accuracy policy.
+
+        Returns:
+            ExecutionHandle[float]: Immediate local result or lazy IBM job.
+
+        Raises:
+            NotImplementedError: If the selected adapter rejects the accuracy.
+            Exception: If validation, compilation, or submission fails.
+        """
+        if self._runtime is not None:
+            return self._runtime.submit_estimate(request)
+        return super().submit_estimate(request)
+
+    def restore(self, reference: ExecutionReference) -> ExecutionHandle[Any]:
+        """Reconnect to an IBM job using the selected backend's service.
+
+        Args:
+            reference (ExecutionReference): Previously saved execution reference.
+
+        Returns:
+            ExecutionHandle[Any]: Restored IBM sample or expectation handle.
+
+        Raises:
+            NotImplementedError: If the selected backend has no restoration.
+            ValueError: If the reference targets another provider or backend.
+            Exception: If the SDK cannot retrieve the job.
+        """
+        if self._runtime is not None:
+            return self._runtime.restore(reference)
+        return super().restore(reference)
+
     def execute(self, circuit: "QuantumCircuit", shots: int) -> dict[str, int]:
         """Execute circuit and return bitstring counts.
 
         Args:
-            circuit: The quantum circuit to execute
-            shots: Number of measurement shots
+            circuit (QuantumCircuit): Qiskit circuit to execute.
+            shots (int): Number of measurement shots.
 
         Returns:
-            Dictionary mapping bitstrings to counts (e.g., {"00": 512, "11": 512})
+            dict[str, int]: Native dictionary mapping bitstrings to counts,
+                without SDK-specific result metadata. A circuit without quantum
+                or classical bits returns ``{"": shots}``.
+
+        Raises:
+            RuntimeError: If no Qiskit backend is available for execution, or
+                if Aer would still receive an empty-parameter multiplexer after
+                the workaround decomposition.
+            Exception: If IBM compilation, submission, or execution fails.
         """
+        if self._runtime is not None:
+            return self._runtime.execute(circuit, shots)
+        if circuit.num_qubits == 0 and circuit.num_clbits == 0:
+            return {"": shots}
+
         from qiskit import transpile
 
         if self.backend is None:
@@ -664,8 +288,12 @@ class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
 
         circuit_with_meas = self._ensure_measurements(circuit)
         transpiled = transpile(circuit_with_meas, self.backend)
+        if type(self.backend).__module__.startswith("qiskit_aer."):
+            transpiled = _decompose_empty_parameter_multiplexers(
+                transpiled, self.backend
+            )
         job = self.backend.run(transpiled, shots=shots)
-        return job.result().get_counts()
+        return dict(job.result().get_counts())
 
     def bind_parameters(
         self,
@@ -676,17 +304,23 @@ class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
         """Bind parameter values to the Qiskit circuit.
 
         Args:
-            circuit: The parameterized circuit
-            bindings: Dict mapping parameter names (indexed format) to values
-            parameter_metadata: Metadata about circuit parameters
+            circuit (QuantumCircuit): Parameterized circuit.
+            bindings (dict[str, Any]): Flattened runtime parameter values.
+            parameter_metadata (ParameterMetadata): Backend parameter mapping.
 
         Returns:
-            New circuit with parameters bound
+            QuantumCircuit: New circuit with parameters bound.
+
+        Raises:
+            ValueError: If required Runtime values are missing.
+            Exception: If Qiskit rejects a parameter assignment.
         """
+        if self._runtime is not None:
+            return self._runtime.bind_parameters(circuit, bindings, parameter_metadata)
         qiskit_bindings = {}
         for param_info in parameter_metadata.parameters:
             if param_info.name in bindings:
-                qiskit_bindings[param_info.backend_param] = bindings[param_info.name]
+                qiskit_bindings[param_info.engine_param] = bindings[param_info.name]
 
         return circuit.assign_parameters(qiskit_bindings)
 
@@ -699,16 +333,19 @@ class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
         """Estimate the expectation value of a Hamiltonian.
 
         Args:
-            circuit: Qiskit QuantumCircuit (state preparation ansatz)
-            hamiltonian: The qamomile.observable.Hamiltonian to measure
-            params: Optional parameter values for parametric circuits
+            circuit (QuantumCircuit): State preparation ansatz.
+            hamiltonian (qm_o.Hamiltonian): Observable to measure.
+            params (Sequence[float] | None): Optional values in Qiskit parameter
+                order. Defaults to None for an already bound circuit.
 
         Returns:
-            The estimated expectation value
+            float: Estimated expectation value.
 
         Raises:
-            RuntimeError: If no estimator is configured
+            Exception: If estimator setup, compilation, or execution fails.
         """
+        if self._runtime is not None:
+            return self._runtime.estimate(circuit, hamiltonian, params)
         if self._estimator is None:
             # Create default Qiskit Estimator
             try:
@@ -759,7 +396,14 @@ class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
             return float(result.values[0])
 
     def _ensure_measurements(self, circuit: "QuantumCircuit") -> "QuantumCircuit":
-        """Ensure circuit has measurements, adding measure_all if needed."""
+        """Add measurements to a copy when there are no classical bits.
+
+        Args:
+            circuit (QuantumCircuit): Local circuit to sample.
+
+        Returns:
+            QuantumCircuit: Original circuit or a copy measuring all qubits.
+        """
         if circuit.num_clbits > 0:
             return circuit
 
@@ -768,15 +412,106 @@ class QiskitExecutor(QuantumExecutor["QuantumCircuit"]):
         return circuit_copy
 
 
+def _validate_runtime_credentials(
+    backend: Any,
+    api_key: str | None,
+    instance_crn: str | None,
+    service: Any,
+) -> None:
+    """Validate named backend and credential combinations before SDK access.
+
+    Args:
+        backend (Any): Local backend, IBM backend name, or None.
+        api_key (str | None): Explicit IBM API key, or None.
+        instance_crn (str | None): Explicit instance CRN, or None.
+        service (Any): Caller-configured Runtime service, or None.
+
+    Raises:
+        ValueError: If the name or credentials are blank, the credential pair
+            is incomplete, or credentials conflict with other configuration.
+    """
+    if isinstance(backend, str) and not backend.strip():
+        raise ValueError("IBM backend name must not be empty")
+    for name, value in (("api_key", api_key), ("instance_crn", instance_crn)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{name} must be a non-empty string")
+    if (api_key is None) != (instance_crn is None):
+        raise ValueError("api_key and instance_crn must be supplied together")
+    if api_key is not None:
+        if not isinstance(backend, str):
+            raise ValueError("Explicit IBM credentials require a backend name")
+        if service is not None:
+            raise ValueError("Use either explicit IBM credentials or a service")
+
+
+def _resolve_ibm_backend(
+    name: str,
+    api_key: str | None,
+    instance_crn: str | None,
+    service: Any,
+) -> tuple[Any, Any]:
+    """Resolve a backend through the account and instance scoped SDK lookup.
+
+    Args:
+        name (str): IBM backend name selected by the caller.
+        api_key (str | None): IBM API key, or None for saved credentials.
+        instance_crn (str | None): Instance CRN, or None for SDK configuration.
+        service (Any): Existing Runtime service, or None to create one.
+
+    Returns:
+        tuple[Any, Any]: Authorized IBM backend and its Runtime service.
+
+    Raises:
+        ImportError: If the optional Runtime SDK is unavailable.
+        QiskitBackendNotFoundError: If the selected account and instance have
+            no matching backend, or the SDK cannot discover the backend list.
+        Exception: If SDK authentication or backend discovery fails.
+    """
+    if service is None:
+        try:
+            from qiskit_ibm_runtime import QiskitRuntimeService
+        except ImportError as error:
+            raise ImportError(
+                'IBM execution requires pip install "qamomile[qiskit]"'
+            ) from error
+        kwargs: dict[str, Any] = {"channel": "ibm_quantum_platform"}
+        if api_key is not None:
+            kwargs["token"] = api_key
+            kwargs["instance"] = instance_crn
+        service = QiskitRuntimeService(**kwargs)
+    lookup = {} if instance_crn is None else {"instance": instance_crn}
+    return service.backend(name, **lookup), service
+
+
+def _is_ibm_backend(backend: Any) -> bool:
+    """Recognize an IBM Runtime backend without requiring the optional SDK.
+
+    Args:
+        backend (Any): Backend object to classify, or None.
+
+    Returns:
+        bool: Whether the object is an IBMBackend instance.
+    """
+    if backend is None:
+        return False
+    try:
+        from qiskit_ibm_runtime import IBMBackend
+    except ImportError:
+        return False
+    return isinstance(backend, IBMBackend)
+
+
 class QiskitTranspiler(Transpiler["QuantumCircuit"]):
-    """Qiskit backend transpiler.
+    """Qiskit engine transpiler.
 
     Converts Qamomile QKernels into Qiskit QuantumCircuits.
 
     Args:
-        use_native_composite: If True (default), use native Qiskit library
-                              implementations for QFT/IQFT. If False, use
-                              manual decomposition for all composite gates.
+        use_native_composite (bool): Whether to prefer native Qiskit library
+            realizations for semantic composites such as QFT/IQFT. Defaults
+            to ``True``.
+        use_native_pauli_evolution (bool): Whether to prefer
+            ``PauliEvolutionGate`` over gate gadgets. Defaults to ``True``.
 
     Example:
         from qamomile.qiskit import QiskitTranspiler
@@ -793,16 +528,30 @@ class QiskitTranspiler(Transpiler["QuantumCircuit"]):
         print(circuit.draw())
     """
 
-    def __init__(self, use_native_composite: bool = True):
+    def __init__(
+        self,
+        use_native_composite: bool = True,
+        use_native_pauli_evolution: bool = True,
+    ) -> None:
         """Initialize the Qiskit transpiler.
 
         Args:
-            use_native_composite: If True, use native Qiskit implementations
-                                  for QFT/IQFT. If False, use manual decomposition.
+            use_native_composite (bool): Whether to prefer engine-native
+                realizations of semantic composites such as QFT, state
+                preparation, arithmetic, and multi-controlled X. Defaults to
+                ``True``.
+            use_native_pauli_evolution (bool): Whether to prefer native Pauli
+                evolution over gate gadgets. Defaults to ``True``.
         """
         self._use_native_composite = use_native_composite
+        self._use_native_pauli_evolution = use_native_pauli_evolution
 
     def _create_segmentation_pass(self) -> SegmentationPass:
+        """Create the host-orchestrated circuit segmentation pass.
+
+        Returns:
+            SegmentationPass: Standard single-quantum-segment planner.
+        """
         return SegmentationPass()
 
     def _create_emit_pass(
@@ -810,20 +559,153 @@ class QiskitTranspiler(Transpiler["QuantumCircuit"]):
         bindings: dict[str, Any] | None = None,
         parameters: list[str] | None = None,
     ) -> EmitPass["QuantumCircuit"]:
-        return QiskitEmitPass(
-            bindings, parameters, use_native_composite=self._use_native_composite
+        """Create the capability-driven Qiskit materialization pipeline.
+
+        Args:
+            bindings (dict[str, Any] | None): Compile-time bindings. Defaults
+                to ``None``.
+            parameters (list[str] | None): Runtime parameter names. Defaults
+                to ``None``.
+
+        Returns:
+            EmitPass[QuantumCircuit]: Circuit lowering, legalization, and
+                Qiskit materialization pass.
+        """
+        return CircuitEngineEmitPass(
+            QiskitMaterializer(),
+            bindings,
+            parameters,
+            policy=CompilationPolicy(
+                prefer_native_semantic_ops=self._use_native_composite,
+                prefer_native_pauli_evolution=self._use_native_pauli_evolution,
+            ),
         )
 
     def executor(  # type: ignore[override]
         self,
-        backend=None,
+        backend: Any = None,
+        *,
+        estimator: Any = None,
+        api_key: str | None = None,
+        instance_crn: str | None = None,
+        mode: Any = None,
+        options: QiskitExecutionOptions | None = None,
+        sampler_options: Any = None,
+        estimator_options: Any = None,
+        pass_manager: Any = None,
+        service: Any = None,
     ) -> QiskitExecutor:
-        """Create a Qiskit executor.
+        """Create a local or IBM Quantum executor with the same execution API.
 
         Args:
-            backend: Qiskit backend (defaults to AerSimulator)
+            backend (Any): Qiskit backend object or IBM backend name. Defaults
+                to a local simulator when None.
+            estimator (Any): Optional local expectation estimator.
+            api_key (str | None): IBM API key for a named backend. Must be
+                paired with ``instance_crn``; defaults to saved credentials.
+            instance_crn (str | None): Instance CRN paired with ``api_key``.
+                Defaults to the SDK's configured instance.
+            mode (Any): Caller-owned Runtime Session, Batch, or local testing
+                backend paired with a backend object. Defaults to None;
+                unavailable with a backend name.
+            options (QiskitExecutionOptions | None): Qamomile-owned Runtime
+                settings. Defaults to None; cannot be combined with direct
+                sampler or estimator options.
+            sampler_options (Any): Runtime sampler options, or None.
+            estimator_options (Any): Runtime estimator options, or None.
+            pass_manager (Any): Runtime hardware compilation pass manager,
+                or None for the backend preset.
+            service (Any): Existing Runtime service for lookup or restoration,
+                or None. Cannot be combined with explicit credentials.
 
         Returns:
-            QiskitExecutor configured with the backend
+            QiskitExecutor: Executor configured for the selected execution target.
+
+        Raises:
+            TypeError: If ``options`` is not a QiskitExecutionOptions instance.
+            ValueError: If credentials are incomplete or arguments conflict.
+            ImportError: If IBM execution is requested without its SDK extra.
+            QiskitBackendNotFoundError: If the selected account and instance
+                have no matching backend.
+            Exception: If SDK authentication or executor setup fails.
+
+        Example:
+            executor = transpiler.executor(
+                backend="your_backend_name",
+                api_key=api_key,
+                instance_crn=instance_crn,
+            )
+            job = executable.sample(executor, shots=1024)
         """
-        return QiskitExecutor(backend)
+        return QiskitExecutor(
+            backend,
+            estimator,
+            api_key=api_key,
+            instance_crn=instance_crn,
+            mode=mode,
+            options=options,
+            sampler_options=sampler_options,
+            estimator_options=estimator_options,
+            pass_manager=pass_manager,
+            service=service,
+        )
+
+
+def _contains_empty_parameter_multiplexer(circuit: "QuantumCircuit") -> bool:
+    """Return whether a circuit contains Aer's unsafe multiplexer form.
+
+    Args:
+        circuit (QuantumCircuit): Qiskit circuit to inspect, including any
+            nested control-flow blocks reachable through ``ControlFlowOp``.
+
+    Returns:
+        bool: True when the circuit contains a ``multiplexer`` instruction
+            whose parameter list is empty, otherwise False.
+    """
+    from qiskit.circuit import ControlFlowOp
+
+    for instruction in circuit.data:
+        operation = instruction.operation
+        if operation.name == "multiplexer" and not operation.params:
+            return True
+        if isinstance(operation, ControlFlowOp) and any(
+            _contains_empty_parameter_multiplexer(block) for block in operation.blocks
+        ):
+            return True
+    return False
+
+
+def _decompose_empty_parameter_multiplexers(
+    circuit: "QuantumCircuit", backend: Any
+) -> "QuantumCircuit":
+    """Decompose Aer's unsafe empty-parameter multiplexers before execution.
+
+    Args:
+        circuit (QuantumCircuit): Transpiled Qiskit circuit to sanitize.
+        backend (Any): Qiskit backend used for the follow-up transpilation.
+
+    Returns:
+        QuantumCircuit: The original circuit when no unsafe multiplexer is
+            present, otherwise a re-transpiled circuit with matching
+            multiplexers decomposed through nested control-flow blocks.
+
+    Raises:
+        RuntimeError: If an empty-parameter multiplexer remains after the
+            decomposition pass and re-transpilation.
+    """
+    if not _contains_empty_parameter_multiplexer(circuit):
+        return circuit
+
+    from qiskit import transpile
+    from qiskit.circuit import ControlFlowOp
+
+    decomposed = transpile(
+        circuit.decompose(gates_to_decompose=["multiplexer", ControlFlowOp], reps=4),
+        backend,
+    )
+    if _contains_empty_parameter_multiplexer(decomposed):
+        raise RuntimeError(
+            "Aer execution would receive an empty-parameter multiplexer that "
+            "can crash native assembly."
+        )
+    return decomposed

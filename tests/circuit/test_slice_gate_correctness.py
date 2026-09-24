@@ -1,7 +1,7 @@
 """Per-gate correctness tests for slice-broadcast and slice-assignment patterns.
 
 This file is the slicing-specific complement to the existing
-single-gate / cross-backend tests in ``tests/circuit/test_*.py``: for
+single-gate / cross-engine tests in ``tests/circuit/test_*.py``: for
 every supported single-qubit gate (and a representative two-qubit
 loop pattern), it pins down that **applying the gate through a
 slice produces the same physical result as applying it qubit-by-qubit
@@ -31,10 +31,10 @@ For each kernel the test asserts **both**:
    slightly-off count.
 
 Qiskit is the reference simulator; ``QuriParts`` / ``CUDA-Q`` cross-
-backend slicing is already covered by the existing alternating-
+engine slicing is already covered by the existing alternating-
 hadamard suite.  We keep the reference deterministic here so that a
 single failing assertion points clearly at the slicing path rather
-than at backend-specific sampling noise.
+than at engine-specific sampling noise.
 """
 
 from __future__ import annotations
@@ -671,7 +671,7 @@ class TestSliceRandomMix:
 # chosen qubit register size and a randomly chosen sequence of
 # single-qubit gates applied inside ``for i in qmc.range(view.shape[0])``.
 # For each random instance the same kernel is transpiled with all three
-# supported SDK backends and the resulting statevector is compared against
+# supported SDK engines and the resulting statevector is compared against
 # the theoretical statevector built directly with Qiskit.  The slice
 # bounds are passed through ``bindings`` so every random case also
 # exercises the symbolic-bounds → bindings-resolved path.
@@ -983,21 +983,52 @@ def _random_slice_lo_step(rng: np.random.Generator):
 _PROPERTY_SEEDS = [0, 1, 7, 11, 42, 123, 999, 2024]
 
 
+_SV_ENGINE_HELPERS = {
+    "qiskit": _qiskit_statevector,
+    "quri_parts": _quri_parts_statevector,
+    "cudaq": _cudaq_statevector,
+}
+
+
+@pytest.fixture(
+    params=[
+        pytest.param("qiskit", id="qiskit"),
+        pytest.param("quri_parts", marks=pytest.mark.quri_parts, id="quri_parts"),
+        pytest.param("cudaq", marks=pytest.mark.cudaq, id="cudaq"),
+    ]
+)
+def sv_engine(request):
+    """Engine name for single-engine statevector assertions.
+
+    The quri_parts / cudaq params carry their markers so each leg only
+    runs in the matching ``-m`` session; in particular the cudaq leg
+    must never load cudaq into a default session (see
+    tests/_cudaq_isolation.py). The SDK import itself happens lazily
+    inside the per-engine statevector helper.
+
+    Args:
+        request (pytest.FixtureRequest): Parametrization carrier.
+
+    Returns:
+        str: One of ``"qiskit"``, ``"quri_parts"``, ``"cudaq"``.
+    """
+    return request.param
+
+
 def _run_property_case(
+    engine: str,
     kern,
     bindings: dict,
     expected_sv: Statevector,
     case_label: str,
 ):
-    """Run the kernel on every available backend and assert SV match.
-
-    The Qiskit backend is mandatory; QuriParts and CUDA-Q are guarded
-    by ``pytest.importorskip`` inside their helpers and skip cleanly
-    when the corresponding SDK is not installed.
+    """Run the kernel on one engine and assert the statevector matches.
 
     Args:
+        engine (str): Engine name supplied by the ``sv_engine``
+            fixture.
         kern: Compiled qkernel.
-        bindings (dict): Bindings to pass to every backend's
+        bindings (dict): Bindings to pass to the engine's
             ``transpile``.
         expected_sv (Statevector): Reference statevector.
         case_label (str): Human-readable label describing the random
@@ -1006,32 +1037,18 @@ def _run_property_case(
     """
     expected_data = np.array(expected_sv.data)
 
-    actual_qiskit = _qiskit_statevector(kern, bindings)
-    assert statevectors_equal(actual_qiskit, expected_data), (
-        f"[qiskit] statevector mismatch for {case_label}.\n"
-        f"  actual:   {actual_qiskit}\n"
-        f"  expected: {expected_data}"
-    )
-
-    actual_quri_parts = _quri_parts_statevector(kern, bindings)
-    assert statevectors_equal(actual_quri_parts, expected_data), (
-        f"[quri_parts] statevector mismatch for {case_label}.\n"
-        f"  actual:   {actual_quri_parts}\n"
-        f"  expected: {expected_data}"
-    )
-
-    actual_cudaq = _cudaq_statevector(kern, bindings)
-    assert statevectors_equal(actual_cudaq, expected_data), (
-        f"[cudaq] statevector mismatch for {case_label}.\n"
-        f"  actual:   {actual_cudaq}\n"
+    actual = _SV_ENGINE_HELPERS[engine](kern, bindings)
+    assert statevectors_equal(actual, expected_data), (
+        f"[{engine}] statevector mismatch for {case_label}.\n"
+        f"  actual:   {actual}\n"
         f"  expected: {expected_data}"
     )
 
 
-class TestPropertyBasedSliceCrossBackend:
+class TestPropertyBasedSliceCrossEngine:
     """Property-style: random register size, random slice, random gates
     must produce the same statevector on Qiskit, QuriParts, and CUDA-Q
-    as the per-qubit Qiskit reference.
+    (parametrized via ``sv_engine``) as the per-qubit Qiskit reference.
 
     The seed drives:
       1. ``n_qubits`` in ``[4, 10]``.
@@ -1046,7 +1063,7 @@ class TestPropertyBasedSliceCrossBackend:
     """
 
     @pytest.mark.parametrize("seed", _PROPERTY_SEEDS)
-    def test_random_slice_lo_hi_step(self, seed: int):
+    def test_random_slice_lo_hi_step(self, sv_engine, seed: int):
         """``q[lo:hi:step]`` with random ``(n_qubits, lo, hi, step)``.
 
         Exercises the most general slice form: all three of ``start``,
@@ -1075,6 +1092,7 @@ class TestPropertyBasedSliceCrossBackend:
         expected_sv = _theoretical_statevector(n_qubits, slice_qubits, gate_seq)
 
         _run_property_case(
+            sv_engine,
             kern,
             bindings,
             expected_sv,
@@ -1085,7 +1103,7 @@ class TestPropertyBasedSliceCrossBackend:
         )
 
     @pytest.mark.parametrize("seed", _PROPERTY_SEEDS)
-    def test_random_slice_lo_hi(self, seed: int):
+    def test_random_slice_lo_hi(self, sv_engine, seed: int):
         """``q[lo:hi]`` (step omitted → 1) with random ``(n_qubits, lo, hi)``.
 
         Exercises the no-step form to ensure the default-step branch
@@ -1114,6 +1132,7 @@ class TestPropertyBasedSliceCrossBackend:
         expected_sv = _theoretical_statevector(n_qubits, slice_qubits, gate_seq)
 
         _run_property_case(
+            sv_engine,
             kern,
             bindings,
             expected_sv,
@@ -1124,7 +1143,7 @@ class TestPropertyBasedSliceCrossBackend:
         )
 
     @pytest.mark.parametrize("seed", _PROPERTY_SEEDS)
-    def test_random_slice_lo_step(self, seed: int):
+    def test_random_slice_lo_step(self, sv_engine, seed: int):
         """``q[lo::step]`` (no ``hi`` → end of parent) with random
         ``(n_qubits, lo, step)``.
 
@@ -1155,6 +1174,7 @@ class TestPropertyBasedSliceCrossBackend:
         expected_sv = _theoretical_statevector(n_qubits, slice_qubits, gate_seq)
 
         _run_property_case(
+            sv_engine,
             kern,
             bindings,
             expected_sv,

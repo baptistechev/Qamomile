@@ -5,15 +5,17 @@ import enum
 import typing
 
 from qamomile.circuit.ir.block import Block
-from qamomile.circuit.ir.types import QFixedType
+from qamomile.circuit.ir.operation.callable import CallableRef
+from qamomile.circuit.ir.types import QFixedType, QUIntType
 from qamomile.circuit.ir.types.primitives import (
     BitType,
     FloatType,
     QubitType,
     UIntType,
 )
-from qamomile.circuit.ir.value import Value, ValueBase
+from qamomile.circuit.ir.value import Value, ValueBase, static_quantum_width
 
+from .control_value import normalize_control_value
 from .operation import Operation, OperationKind, ParamHint, Signature
 
 
@@ -148,6 +150,47 @@ class MeasureOperation(Operation):
 
 
 @dataclasses.dataclass
+class ProjectOperation(Operation):
+    """Project a qubit in one Pauli basis and keep the projected state."""
+
+    axis: str = "z"
+
+    def __post_init__(self):
+        if self.axis not in {"x", "y", "z"}:
+            raise ValueError("axis must be one of 'x', 'y', or 'z'.")
+
+    @property
+    def signature(self) -> Signature:
+        return Signature(
+            operands=[ParamHint(name="qubit", type=QubitType())],
+            results=[
+                ParamHint(name="qubit", type=QubitType()),
+                ParamHint(name="bit", type=BitType()),
+            ],
+        )
+
+    @property
+    def operation_kind(self) -> OperationKind:
+        return OperationKind.HYBRID
+
+
+@dataclasses.dataclass
+class ResetOperation(Operation):
+    """Reset a qubit to the |0> state and return the fresh handle."""
+
+    @property
+    def signature(self) -> Signature:
+        return Signature(
+            operands=[ParamHint(name="qubit", type=QubitType())],
+            results=[ParamHint(name="qubit", type=QubitType())],
+        )
+
+    @property
+    def operation_kind(self) -> OperationKind:
+        return OperationKind.QUANTUM
+
+
+@dataclasses.dataclass
 class ControlledUOperation(Operation):
     """Base class for controlled-U operations.
 
@@ -171,19 +214,22 @@ class ControlledUOperation(Operation):
             (``int | Value``). The default ``1`` is a dataclass slot
             reservation — ``ControlledUOperation`` is never instantiated
             directly (concrete subclasses are the only producers; see the
-            pattern-match dispatch in
-            ``qamomile/circuit/estimator/qubits_counter.py:262,393`` and
-            ``qamomile/circuit/estimator/gate_counter.py:161``). Every
-            concrete subclass redeclares ``num_controls`` with the correct
-            narrow type and the default it actually wants
+            pattern-match dispatch in the symbolic ``ResourceEstimator``).
+            Every concrete subclass redeclares ``num_controls`` with the
+            correct narrow type and the default it actually wants
             (``ConcreteControlledU``: ``int = 1`` matches the single-control
             shape; ``SymbolicControlledU``: a ``UIntType`` ``Value`` placeholder
             via ``default_factory``).
+        callable_ref: Stable identity of the controlled callable.
+        callable_attrs: Serializer-friendly attrs copied from the controlled
+            callable definition.
     """
 
     power: int | Value = 1
     block: Block | None = None
     num_controls: int | Value = 1
+    callable_ref: CallableRef | None = None
+    callable_attrs: dict[str, typing.Any] = dataclasses.field(default_factory=dict)
 
     @property
     def is_symbolic_num_controls(self) -> bool:
@@ -196,13 +242,32 @@ class ControlledUOperation(Operation):
         raise NotImplementedError  # pragma: no cover
 
     @property
+    def body_operands(self) -> list[Value]:
+        """Get the wrapped callable's complete argument list.
+
+        Returns:
+            list[Value]: Quantum, classical, and object operands after the
+                external control prefix, in wrapped-callable argument order.
+        """
+        return list(self.operands[len(self.control_operands) :])
+
+    @property
     def target_operands(self) -> list[Value]:
         """Get the target qubit values (arguments to U)."""
         raise NotImplementedError  # pragma: no cover
 
     @property
     def param_operands(self) -> list[Value]:
-        """Get parameter operands (non-qubit, non-block)."""
+        """Get the controlled operation's classical/object arguments.
+
+        Returns:
+            list[Value]: Non-quantum operands after the control prefix, in
+            wrapped-kernel signature order.
+
+        Raises:
+            NotImplementedError: Always, because subclasses define their
+                concrete operand layout.
+        """
         raise NotImplementedError  # pragma: no cover
 
     @property
@@ -242,9 +307,30 @@ class ConcreteControlledU(ControlledUOperation):
 
     Operand layout: ``[ctrl_0, ..., ctrl_n, tgt_0, ..., tgt_m, params...]``
     Result layout:  ``[ctrl_0', ..., ctrl_n', tgt_0', ..., tgt_m']``
+
+    Attributes:
+        num_controls (int): Number of leading scalar control operands.
+        control_value (int | None): LSB-first computational-basis value that
+            activates the control. ``None`` is the canonical ordinary
+            all-ones state.
     """
 
     num_controls: int = 1
+    control_value: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate and canonicalize concrete control metadata.
+
+        Raises:
+            TypeError: If ``control_value`` is not a Python ``int`` or
+                ``None``.
+            ValueError: If ``num_controls`` is not positive or the activation
+                value does not fit in the control-register width.
+        """
+        self.control_value = normalize_control_value(
+            self.control_value,
+            self.num_controls,
+        )
 
     @property
     def control_operands(self) -> list[Value]:
@@ -252,23 +338,41 @@ class ConcreteControlledU(ControlledUOperation):
 
     @property
     def target_operands(self) -> list[Value]:
-        return self.operands[self.num_controls :]
+        """Return the wrapped callable's target and parameter operands.
+
+        Returns:
+            list[Value]: Complete body operands after the concrete controls.
+        """
+        return self.body_operands
 
     @property
     def param_operands(self) -> list[Value]:
+        """Get classical/object operands after the concrete control prefix.
+
+        Returns:
+            list[Value]: Classical and object operands in wrapped-kernel
+            signature order.
+        """
         return [
-            op for op in self.operands[self.num_controls :] if op.type.is_classical()
+            op
+            for op in self.body_operands
+            if op.type.is_classical() or op.type.is_object()
         ]
 
     @property
     def signature(self) -> Signature:
+        """Build the concrete controlled call signature.
+
+        Returns:
+            Signature: Control-prefixed operand and result contract.
+        """
         nc = self.num_controls
         return Signature(
             operands=[
                 *[ParamHint(name=f"control_{i}", type=QubitType()) for i in range(nc)],
                 *[
                     ParamHint(name=f"arg_{i}", type=op.type)
-                    for i, op in enumerate(self.operands[nc:])
+                    for i, op in enumerate(self.body_operands)
                 ],
             ],
             results=[
@@ -344,14 +448,26 @@ class SymbolicControlledU(ControlledUOperation):
 
     @property
     def target_operands(self) -> list[Value]:
-        return list(self.operands[self.num_control_args :])
+        """Return the wrapped callable's target and parameter operands.
+
+        Returns:
+            list[Value]: Complete body operands after the symbolic control
+                arguments.
+        """
+        return self.body_operands
 
     @property
     def param_operands(self) -> list[Value]:
+        """Get classical/object operands after the symbolic control prefix.
+
+        Returns:
+            list[Value]: Classical and object operands in wrapped-kernel
+            signature order.
+        """
         return [
             op
-            for op in self.operands[self.num_control_args :]
-            if op.type.is_classical()
+            for op in self.body_operands
+            if op.type.is_classical() or op.type.is_object()
         ]
 
     @property
@@ -431,7 +547,8 @@ class MeasureQFixedOperation(Operation):
 
     Encoding:
         For QPE phase (int_bits=0):
-            float_value = 0.b0b1b2... = b0*0.5 + b1*0.25 + b2*0.125 + ...
+            Qubits are stored least-significant first. For ``n`` qubits,
+            bit ``i`` has weight ``2**(-n + i)``.
     """
 
     num_bits: int = 0
@@ -447,3 +564,54 @@ class MeasureQFixedOperation(Operation):
     @property
     def operation_kind(self) -> OperationKind:
         return OperationKind.HYBRID  # Quantum measurement + classical decode
+
+
+@dataclasses.dataclass
+class MeasureQIntOperation(Operation):
+    """Measure an unsigned quantum integer as one abstract hybrid operation.
+
+    The carrier sequence is least-significant-bit first: carrier ``i`` has
+    integer weight ``2**i``. Planning lowers this operation to one vector
+    measurement followed by a host-side ``DecodeQIntOperation``.
+
+    The carrier width is not stored on the operation: it is derived from the
+    register operand's type and carrier metadata through ``num_bits``.
+
+    Args:
+        operands (list[Value]): Single ``QUIntType`` register operand.
+        results (list[Value]): Single decoded ``UIntType`` result.
+    """
+
+    @property
+    def num_bits(self) -> int | None:
+        """Return the carrier count derived from the register operand.
+
+        Returns:
+            int | None: Carrier count, including zero for an empty register;
+                ``None`` when the width is symbolic or the operand is missing.
+        """
+        if not self.operands:
+            return None
+        return static_quantum_width(self.operands[0])
+
+    @property
+    def signature(self) -> Signature:
+        """Return the packed-register measurement signature.
+
+        Returns:
+            Signature: One quantum unsigned-integer operand and one classical
+                unsigned-integer result.
+        """
+        return Signature(
+            operands=[ParamHint(name="qint", type=QUIntType(width=0))],
+            results=[ParamHint(name="uint_out", type=UIntType())],
+        )
+
+    @property
+    def operation_kind(self) -> OperationKind:
+        """Classify QInt measurement as a quantum-to-classical bridge.
+
+        Returns:
+            OperationKind: ``OperationKind.HYBRID``.
+        """
+        return OperationKind.HYBRID

@@ -30,16 +30,19 @@
 
 # %%
 # Install the latest Qamomile through pip!
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit,visualization]"
 
 # %%
 import math
+import os
 
 import qamomile.circuit as qmc
 import qamomile.observable as qmo
 from qamomile.qiskit import QiskitTranspiler
 
 transpiler = QiskitTranspiler()
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+sample_shots = 1 if docs_test_mode else 256
 
 # %% [markdown]
 # ## Multi-Qubit `sample()`
@@ -67,14 +70,14 @@ parity_probe.draw(theta=0.7)
 exe_sample = transpiler.transpile(parity_probe, parameters=["theta"])
 sample_result = exe_sample.sample(
     transpiler.executor(),
-    shots=256,
+    shots=sample_shots,
     bindings={"theta": 0.7},
 ).result()
 
 for outcome, count in sample_result.results:
     print(f"  outcome={outcome}, count={count}")
-assert sample_result.shots == 256
-assert sum(count for _, count in sample_result.results) == 256
+assert sample_result.shots == sample_shots
+assert sum(count for _, count in sample_result.results) == sample_shots
 # parity_probe returns tuple[Bit, Bit] -> each outcome is a 2-element tuple.
 assert all(
     isinstance(outcome, tuple) and len(outcome) == 2
@@ -85,20 +88,9 @@ assert all(
 # Each `outcome` is a tuple like `(0, 1)` or `(1, 0)`. The first element corresponds to `q0`, the second to `q1`, matching the order in the `return` statement.
 
 # %% [markdown]
-# ## Bit Ordering Convention
+# ## Measurement Result Ordering
 #
-# Qamomile uses **big-endian** ordering in its output: the **leftmost** position corresponds to the **first** qubit in the return tuple.
-#
-# For a qkernel returning `(measure(q0), measure(q1), measure(q2))`:
-#
-# | Outcome tuple | q0 | q1 | q2 |
-# |--------------|----|----|-----|
-# | `(0, 1, 1)` | 0 | 1 | 1 |
-# | `(1, 0, 0)` | 1 | 0 | 0 |
-#
-# This is straightforward — position `i` in the tuple is qubit `i` in the return.
-#
-# > **Note**: Qiskit internally uses little-endian, but Qamomile handles the conversion for you. You always get results in the order you wrote them.
+# When Qamomile measures qubits, each outcome returned by `sample()` is a tuple of bits in the order specified by the qkernel's `return` statement. When measuring `qs: Vector[Qubit]` directly with `measure(qs)`, each outcome is ordered as `bits = (measure(qs[0]), measure(qs[1]), measure(qs[2]), ...)`. When interpreting a bit tuple as one bitstring, treat `bits[0]` as the least-significant bit.
 
 # %% [markdown]
 # ## When You Need Expectation Values

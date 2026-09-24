@@ -30,16 +30,19 @@
 
 # %%
 # 最新のQamomileをpipからインストールします！
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit,visualization]"
 
 # %%
 import math
+import os
 
 import qamomile.circuit as qmc
 import qamomile.observable as qmo
 from qamomile.qiskit import QiskitTranspiler
 
 transpiler = QiskitTranspiler()
+docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
+sample_shots = 1 if docs_test_mode else 256
 
 # %% [markdown]
 # ## 複数量子ビットの`sample()`
@@ -67,14 +70,14 @@ parity_probe.draw(theta=0.7)
 exe_sample = transpiler.transpile(parity_probe, parameters=["theta"])
 sample_result = exe_sample.sample(
     transpiler.executor(),
-    shots=256,
+    shots=sample_shots,
     bindings={"theta": 0.7},
 ).result()
 
 for outcome, count in sample_result.results:
     print(f"  outcome={outcome}, count={count}")
-assert sample_result.shots == 256
-assert sum(count for _, count in sample_result.results) == 256
+assert sample_result.shots == sample_shots
+assert sum(count for _, count in sample_result.results) == sample_shots
 # parity_probe は tuple[Bit, Bit] を返す → 各 outcome は 2 要素 tuple。
 assert all(
     isinstance(outcome, tuple) and len(outcome) == 2
@@ -85,20 +88,9 @@ assert all(
 # 各`outcome`は`(0, 1)`や`(1, 0)`のようなタプルです。最初の要素は`q0`に、2番目の要素は`q1`に対応し、`return`文での順序と一致します。
 
 # %% [markdown]
-# ## ビット順序の規約
+# ## 測定の返り値順序
 #
-# Qamomileの出力は**ビッグエンディアン**順序を使用します：**最も左**の位置が戻り値タプルの**最初の**量子ビットに対応します。
-#
-# `(measure(q0), measure(q1), measure(q2))`を返す量子カーネルの場合：
-#
-# | 結果タプル | q0 | q1 | q2 |
-# |--------------|----|----|-----|
-# | `(0, 1, 1)` | 0 | 1 | 1 |
-# | `(1, 0, 0)` | 1 | 0 | 0 |
-#
-# タプルの位置`i`が戻り値の量子ビット`i`に対応します。
-#
-# > **注意**：Qiskitは内部的にリトルエンディアンを使用しますが、Qamomileが変換を処理します。結果は常に記述した順序で得られます。
+# Qamomileで測定したとき、`sample()`の各測定結果は、量子カーネルの`return`で指定した順序のビットのタプルとして返ります。`qs: Vector[Qubit]`をそのまま測定（`measure(qs)`）した場合、その測定結果は`bits = (measure(qs[0]), measure(qs[1]), measure(qs[2]), ...)`に対応する順序で返ります。ビットのタプルを1つのビット列として解釈する場合、`bits[0]`を最下位ビットとして扱います。
 
 # %% [markdown]
 # ## 期待値が必要な場合

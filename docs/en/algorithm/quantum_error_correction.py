@@ -33,9 +33,9 @@
 
 # %%
 # Install the latest Qamomile from pip.
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit]"
 # # or
-# # !uv add qamomile
+# # !uv add "qamomile[qiskit]"
 
 # %% [markdown]
 # ## 1. Why Quantum Error Correction Is Hard
@@ -118,7 +118,7 @@
 # From the next section on, we implement this flow with the simplest code — the 3-qubit bit-flip code.
 
 # %% [markdown]
-# Before getting into the implementation, we load Qamomile and the Qiskit backend and define two helper functions. `_first_bit_distribution` and `_sample_first_bit` are just utilities that compile and run a kernel and return the 0/1 counts of the first bit. They are not central to QEC, so feel free to skip them.
+# Before getting into the implementation, we load Qamomile and the Qiskit integration and define two helper functions. `_first_bit_distribution` and `_sample_first_bit` are just utilities that compile and run a kernel and return the 0/1 counts of the first bit. They are not central to QEC, so feel free to skip them.
 
 # %%
 import math
@@ -129,8 +129,8 @@ from qamomile.circuit import SampleResult
 from qamomile.qiskit import QiskitTranspiler
 
 docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-default_shots = 64 if docs_test_mode else 256
-superposition_shots = 512 if docs_test_mode else 2000
+default_shots = 1 if docs_test_mode else 256
+superposition_shots = 1 if docs_test_mode else 2000
 
 transpiler = QiskitTranspiler()
 
@@ -357,7 +357,8 @@ for label, error_pos in bitflip_cases:
     )
     total = counts[0] + counts[1]
     print(f"  {label:14s}: P(data[0]=1) = {counts[1] / total:.3f}")
-    assert abs(counts[1] / total - 0.25) < (0.08 if docs_test_mode else 0.05)
+    if not docs_test_mode:
+        assert abs(counts[1] / total - 0.25) < 0.05
     assert total == superposition_shots
 
 # %% [markdown]

@@ -33,9 +33,9 @@
 
 # %%
 # 最新のQamomileをpipからインストールします。
-# # !pip install qamomile
+# # !pip install "qamomile[qiskit]"
 # # or
-# # !uv add qamomile
+# # !uv add "qamomile[qiskit]"
 
 # %% [markdown]
 # ## 1. なぜ量子の誤り訂正は難しいのか
@@ -122,7 +122,7 @@
 # 次節からは、いちばんシンプルな3量子ビット bit-flip 符号で、この流れを実装していきます。
 
 # %% [markdown]
-# 実装に入る前に、Qamomile と Qiskit バックエンドを読み込み、補助関数を2つ用意します。`_first_bit_distribution` と `_sample_first_bit` は、カーネルをコンパイル・実行して先頭ビットの 0/1 集計を返すだけのユーティリティです。QEC の本筋ではないので、読み飛ばして構いません。
+# 実装に入る前に、QamomileとQiskit連携を読み込み、補助関数を2つ用意します。`_first_bit_distribution`と`_sample_first_bit`は、カーネルをコンパイル・実行して先頭ビットの0/1集計を返すだけのユーティリティです。QECの本筋ではないので、読み飛ばして構いません。
 
 # %%
 import math
@@ -133,8 +133,8 @@ from qamomile.circuit import SampleResult
 from qamomile.qiskit import QiskitTranspiler
 
 docs_test_mode = os.environ.get("QAMOMILE_DOCS_TEST") == "1"
-default_shots = 64 if docs_test_mode else 256
-superposition_shots = 512 if docs_test_mode else 2000
+default_shots = 1 if docs_test_mode else 256
+superposition_shots = 1 if docs_test_mode else 2000
 
 transpiler = QiskitTranspiler()
 
@@ -361,7 +361,8 @@ for label, error_pos in bitflip_cases:
     )
     total = counts[0] + counts[1]
     print(f"  {label:14s}: P(data[0]=1) = {counts[1] / total:.3f}")
-    assert abs(counts[1] / total - 0.25) < (0.08 if docs_test_mode else 0.05)
+    if not docs_test_mode:
+        assert abs(counts[1] / total - 0.25) < 0.05
     assert total == superposition_shots
 
 # %% [markdown]

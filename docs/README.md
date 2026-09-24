@@ -48,6 +48,9 @@ independent goals, split it into two pages.
 - **Docs as tests**: every runnable notebook should include assertions for the
   important shapes, counts, or result properties. Keep runtime small enough for
   [tests/docs/test_tutorials.py](../tests/docs/test_tutorials.py).
+- **Execute English pages in CI**: docs tests use the English page as the
+  canonical runtime check. Changes to shared executable code, CI settings, and
+  assertions must be mirrored in the Japanese counterpart.
 - **No manual References section**: use MyST cross-references, citations, or
   external links instead of hand-maintaining a References section.
 - **Use MyST notes for remarks**: tips, notes, and remarks should use
@@ -94,6 +97,12 @@ ReadTheDocs builds with `execute.enabled: false`, assuming that executed `.ipynb
 > pre-push workflow), make sure `QAMOMILE_DOCS_TEST` is **unset** (or not
 > equal to `"1"`) so the notebooks run with the full settings and produce
 > the high-quality outputs intended for readers.
+>
+> CI settings are execution-path smoke settings rather than statistical or
+> optimization-quality settings. One-shot sampling, minimum optimizer budgets,
+> representative cases, and synthetic input data are acceptable under the flag
+> as long as the same transpile/execute/decode or forward/backward path reaches
+> completion. Normal notebook execution must retain the reader-facing settings.
 
 ## Directory Guide
 
@@ -120,14 +129,13 @@ ReadTheDocs builds with `execute.enabled: false`, assuming that executed `.ipynb
 Run this once before editing or building docs:
 
 ```bash
-uv sync
+uv sync --group docs
 ```
 
-To execute notebooks that need optional extras:
-
-```bash
-uv sync --extra OPTIONAL_DEPENDENCY    # e.g. quri_parts, cudaq-cu13
-```
+The `docs` group includes the regular development tools and the
+credential-free engine integrations exercised by the documentation suite.
+Pages that require external credentials still need their service-specific
+setup.
 
 ### Editing an existing page
 
@@ -304,11 +312,21 @@ pipeline runs [docs/scripts/build_doc_tags.py](scripts/build_doc_tags.py)
 against `_build_src/`
 (the scratch copy) and turns those declarations into:
 
+Section index cards can also show an article thumbnail. Add an optional
+`thumbnail:` field to the same article frontmatter; the value is emitted
+as written into the matching section card. When `thumbnail:` is omitted,
+the card uses `../../assets/qamomile_logo.png`. Paths should resolve from
+the section index page (for shared assets, that usually means
+`../../assets/<image>`). Inline code spans in card bodies are converted
+to raw `<code>` elements in the build copy because MyST card bodies do
+not currently parse inline Markdown there.
+
 | Output | Where it ends up | In git? |
 |---|---|---|
 | Tag landing page | `_build_src/<lang>/tags/index.md` | no |
-| Per-tag pages | `_build_src/<lang>/tags/<tag>.md` (one per tag) | no |
+| Per-tag pages with article cards | `_build_src/<lang>/tags/<tag>.md` (one per tag) | no |
 | Inline tag chips at the top of each article | injected into the `.py`/`.ipynb` inside `_build_src/<lang>/<section>/` | no |
+| Section-index card tag chips, thumbnail slots, and header links | injected into cards inside `_build_src/<lang>/<section>/index.md` | no |
 | Browse-by-tag chip cloud on each section's `index.md` | injected into `_build_src/<lang>/<section>/index.md` | no |
 
 Where the script injects in the build-dir copy:
@@ -316,14 +334,16 @@ Where the script injects in the build-dir copy:
 | Where | How the script finds the spot |
 |---|---|
 | Article `.py` body | inserted right after the first H1 |
-| Section `index.md` | a whole `## Browse by tag` section is synthesised and inserted right before the first H2 (e.g. before `## All articles`) |
+| Section `index.md` cards | matched by each card's `:link:` target (or an already linked header) and the corresponding article slug; generated output links the header so card tags can remain clickable |
+| Per-tag result cards | reuse the matching section `index.md` card body as the article summary |
+| Section `index.md` browse block | a whole `## Browse by tag` section is synthesised and inserted before the article card grid, or before the H2 that introduces that grid |
 
 The per-tag pages are picked up by mystmd via a single
 `- pattern: "tags/*.md"` toc entry in each language's `myst.yml`
 ([en](en/myst.yml), [ja](ja/myst.yml)) with `hidden: true`, so the
 script does **not** maintain any region inside those files. The committed
 source therefore has no tag-managed regions to track — articles and
-section index pages stay hand-written. The API reference has a separate
+section index page summaries stay hand-written. The API reference has a separate
 auto-generated TOC region in `myst.yml`, managed by
 [docs/generate_api.py](generate_api.py).
 
@@ -353,10 +373,10 @@ notes (`release_notes/`) are intentionally out of scope and never tagged.
 
 ### "No module named 'qamomile'"
 
-Ensure dev dependencies are installed in the active env:
+Ensure documentation dependencies are installed in the active environment:
 
 ```bash
-uv sync
+uv sync --group docs
 ```
 
 ### Port 8000 already in use

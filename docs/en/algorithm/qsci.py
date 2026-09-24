@@ -43,7 +43,7 @@
 #
 # This tutorial walks through the full flow on a four-qubit transverse-
 # field Ising model. The quantum state preparation and sampling run on
-# the **QURI Parts** backend (Qulacs simulator); the subspace
+# the **QURI Parts** integration (Qulacs simulator); the subspace
 # construction and diagonalization use
 # `qamomile.linalg.solve_subspace`, which internally calls the
 # vectorised Z-basis routine `subspace_hamiltonian` (XOR / parity, no
@@ -149,7 +149,7 @@ def ansatz_measure(
 
 
 # %% [markdown]
-# ## Compile both kernels with the QURI Parts backend
+# ## Compile both kernels with QURI Parts
 
 # %%
 transpiler = QuriPartsTranspiler()
@@ -211,7 +211,7 @@ assert opt_params.shape == (n_params,)
 # `subspace_hamiltonian` expects.
 
 # %%
-shots = 500 if docs_test_mode else 4000
+shots = 1 if docs_test_mode else 4000
 sample_results = (
     sample_exec.sample(executor, bindings={"thetas": list(opt_params)}, shots=shots)
     .result()
