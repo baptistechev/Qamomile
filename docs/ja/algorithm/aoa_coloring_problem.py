@@ -50,6 +50,20 @@ from qamomile.circuit.stdlib.state_preparation import prepare_dicke
 from qamomile.optimization.aoa import AOAConverter
 from qamomile.qiskit import QiskitTranspiler
 
+# グラフの日本語ラベル用フォント（インストール済みの最初のフォントが使われます）。
+JP_FONT = {
+    "font.family": "sans-serif",
+    "font.sans-serif": [
+        "Noto Sans CJK JP",
+        "IPAexGothic",
+        "Hiragino Sans",
+        "Yu Gothic",
+        "Meiryo",
+        "DejaVu Sans",
+    ],
+    "axes.unicode_minus": False,
+}
+
 # %% [markdown]
 # ## 背景
 #
@@ -134,17 +148,18 @@ assert G.number_of_nodes() == num_nodes
 assert G.number_of_edges() == len(edge_list)
 
 pos = nx.spring_layout(G, seed=1)
-plt.figure(figsize=(5, 5))
-nx.draw(
-    G,
-    pos,
-    with_labels=True,
-    node_color="white",
-    node_size=700,
-    edgecolors="black",
-)
-plt.title(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-plt.show()
+with plt.rc_context(JP_FONT):
+    plt.figure(figsize=(5, 5))
+    nx.draw(
+        G,
+        pos,
+        with_labels=True,
+        node_color="white",
+        node_size=700,
+        edgecolors="black",
+    )
+    plt.title(f"グラフ：ノード{G.number_of_nodes()}個、辺{G.number_of_edges()}本")
+    plt.show()
 
 # %% [markdown]
 # JijModelingの問題に具体的なデータを与えて評価し、$N \times K = 15$個の二値変数とノードごとに1つの制約を持つOMMXインスタンスを得ます。
@@ -391,12 +406,13 @@ assert len(res.x) == 2 * p
 # %%
 assert np.all(np.isfinite(cost_history))
 
-plt.figure(figsize=(8, 4))
-plt.plot(cost_history, color="#2696EB")
-plt.xlabel("Iteration")
-plt.ylabel("Cost (mean energy)")
-plt.title("AOA Optimization Progress")
-plt.show()
+with plt.rc_context(JP_FONT):
+    plt.figure(figsize=(8, 4))
+    plt.plot(cost_history, color="#2696EB")
+    plt.xlabel("反復回数")
+    plt.ylabel("コスト（平均エネルギー）")
+    plt.title("AOAの最適化の推移")
+    plt.show()
 
 # %% [markdown]
 # ### 最適化されたパラメータでのサンプリング
@@ -465,12 +481,13 @@ assert num_conflicts == round(best.objective)
 obj_counts = summary["objective"].value_counts().sort_index()
 assert obj_counts.sum() == total_samples
 
-plt.figure(figsize=(8, 4))
-plt.bar([str(int(o)) for o in obj_counts.index], obj_counts.values, color="#2696EB")
-plt.xlabel("Number of conflicts (objective value)")
-plt.ylabel("Frequency")
-plt.title("Distribution of Solutions")
-plt.show()
+with plt.rc_context(JP_FONT):
+    plt.figure(figsize=(8, 4))
+    plt.bar([str(int(o)) for o in obj_counts.index], obj_counts.values, color="#2696EB")
+    plt.xlabel("衝突の数（目的関数値）")
+    plt.ylabel("頻度")
+    plt.title("衝突の数の分布")
+    plt.show()
 
 # %% [markdown]
 # ### 最良の彩色パターンの可視化
@@ -482,17 +499,18 @@ palette = ["#FF6B6B", "#4ECDC4", "#1A535C"]
 color_map = [palette[best_coloring[u]] for u in range(num_nodes)]
 assert len(color_map) == num_nodes
 
-plt.figure(figsize=(5, 5))
-nx.draw(
-    G,
-    pos,
-    with_labels=True,
-    node_color=color_map,
-    node_size=700,
-    edgecolors="black",
-)
-plt.title(f"Best coloring: {num_conflicts} conflict(s)")
-plt.show()
+with plt.rc_context(JP_FONT):
+    plt.figure(figsize=(5, 5))
+    nx.draw(
+        G,
+        pos,
+        with_labels=True,
+        node_color=color_map,
+        node_size=700,
+        edgecolors="black",
+    )
+    plt.title(f"最良の彩色パターン：衝突の数{num_conflicts}")
+    plt.show()
 
 # %% [markdown]
 # ## まとめ
