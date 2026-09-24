@@ -77,6 +77,18 @@ __all__ = [
     "fqaoa_state",
     # Trotterization
     "trotterized_time_evolution",
+    # GAS primitives
+    "qft_encoding",
+    "zero_degree_qft_encoding",
+    "first_degree_qft_encoding",
+    "second_degree_qft_encoding",
+    "apply_function_preparation_qubo",
+    "apply_function_preparation_qubo_dagger",
+    "diffusion_op",
+    "function_preparation_qubo",
+    "function_preparation_qubo_dagger",
+    "grover_operator",
+    "grover_algorithm",
     # QSVT eigenstate filtering
     "qsvt_filter_projector",
     "qsvt_filter_probe",
