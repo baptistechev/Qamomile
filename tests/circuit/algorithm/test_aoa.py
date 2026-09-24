@@ -23,13 +23,15 @@ from qamomile.circuit.algorithm.aoa import (
 # Backend registry
 # ---------------------------------------------------------------------------
 
-BACKENDS: list[tuple[str, type]] = []
+# Optional backends carry their pytest marker so the dedicated
+# ``-m quri_parts`` / ``-m cudaq`` runs select them and default runs skip them.
+BACKENDS: list = []
 try:
     import qiskit  # noqa: F401
 
     from qamomile.qiskit.transpiler import QiskitTranspiler
 
-    BACKENDS.append(("qiskit", QiskitTranspiler))
+    BACKENDS.append(pytest.param("qiskit", QiskitTranspiler, id="qiskit"))
 except ImportError:
     pass
 try:
@@ -37,7 +39,14 @@ try:
 
     from qamomile.quri_parts.transpiler import QuriPartsTranspiler
 
-    BACKENDS.append(("quri_parts", QuriPartsTranspiler))
+    BACKENDS.append(
+        pytest.param(
+            "quri_parts",
+            QuriPartsTranspiler,
+            marks=pytest.mark.quri_parts,
+            id="quri_parts",
+        )
+    )
 except ImportError:
     pass
 # cudaq imports ``torch`` at import time, whose OpenMP runtime segfaults
@@ -48,7 +57,9 @@ except ImportError:
 if importlib.util.find_spec("cudaq") is not None:
     from qamomile.cudaq.transpiler import CudaqTranspiler
 
-    BACKENDS.append(("cudaq", CudaqTranspiler))
+    BACKENDS.append(
+        pytest.param("cudaq", CudaqTranspiler, marks=pytest.mark.cudaq, id="cudaq")
+    )
 
 if not BACKENDS:
     pytest.skip("No quantum backend available", allow_module_level=True)
@@ -125,6 +136,17 @@ def _wrap_xy_pair_rotation(
     j: qmc.UInt,
     beta: qmc.Float,
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``xy_pair_rotation`` on the ``(i, j)`` pair of an ``n``-qubit ``|0...0>`` register through the sampling path.
+
+    Args:
+        n (qmc.UInt): Number of qubits in the register.
+        i (qmc.UInt): Index of the first qubit of the XY pair.
+        j (qmc.UInt): Index of the second qubit of the XY pair.
+        beta (qmc.Float): XY rotation angle.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = qmc.qubit_array(n, name="q")
     q = xy_pair_rotation(q, i, j, beta)
     return qmc.measure(q)
@@ -135,6 +157,15 @@ def _wrap_xy_pair_rotation_expval_from_01(
     beta: qmc.Float,
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``xy_pair_rotation`` on the two-qubit state ``|01>`` through the expectation-value path.
+
+    Args:
+        beta (qmc.Float): XY rotation angle.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = qmc.qubit_array(2, name="q")
     q[1] = qmc.x(q[1])  # prepare |q[1]=1> = |01>
     q = xy_pair_rotation(q, 0, 1, beta)
@@ -147,6 +178,16 @@ def _wrap_xy_mixer(
     beta: qmc.Float,
     pair_indices_mixer: qmc.Matrix[qmc.UInt],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``xy_mixer`` on an ``n``-qubit ``|0...0>`` register through the sampling path.
+
+    Args:
+        n (qmc.UInt): Number of qubits in the register.
+        beta (qmc.Float): XY rotation angle.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = qmc.qubit_array(n, name="q")
     q = xy_mixer(q, beta, pair_indices_mixer)
     return qmc.measure(q)
@@ -162,6 +203,20 @@ def _wrap_aoa_state_superposition(
     betas: qmc.Vector[qmc.Float],
     pair_indices_mixer: qmc.Matrix[qmc.UInt],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``aoa_state_superposition`` through the sampling path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = aoa_state_superposition(
         p=p,
         quad=quad,
@@ -186,6 +241,22 @@ def _wrap_aoa_state_dicke(
     initial_ones: qmc.Vector[qmc.UInt],
     schedule_dicke: qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``aoa_state_dicke`` through the sampling path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        schedule_dicke (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Ordered SCS gate schedule for the Dicke preparation.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = aoa_state_dicke(
         p=p,
         quad=quad,
@@ -211,6 +282,21 @@ def _wrap_aoa_state_superposition_expval(
     pair_indices_mixer: qmc.Matrix[qmc.UInt],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``aoa_state_superposition`` through the expectation-value path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = aoa_state_superposition(
         p=p,
         quad=quad,
@@ -236,6 +322,23 @@ def _wrap_aoa_state_dicke_expval(
     schedule_dicke: qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``aoa_state_dicke`` through the expectation-value path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        schedule_dicke (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Ordered SCS gate schedule for the Dicke preparation.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = aoa_state_dicke(
         p=p,
         quad=quad,
@@ -262,6 +365,22 @@ def _wrap_aoa_state_basis_state_expval(
     initial_ones: qmc.Vector[qmc.UInt],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``aoa_state_basis_state`` through the expectation-value path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = aoa_state_basis_state(
         p=p,
         quad=quad,
@@ -527,6 +646,21 @@ def _wrap_hubo_aoa_state_superposition(
     betas: qmc.Vector[qmc.Float],
     pair_indices_mixer: qmc.Matrix[qmc.UInt],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``hubo_aoa_state_superposition`` through the sampling path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        higher (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Higher-order cost coefficients keyed by qubit-index vectors.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = hubo_aoa_state_superposition(
         p=p,
         quad=quad,
@@ -552,6 +686,22 @@ def _wrap_hubo_aoa_state_superposition_expval(
     pair_indices_mixer: qmc.Matrix[qmc.UInt],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``hubo_aoa_state_superposition`` through the expectation-value path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        higher (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Higher-order cost coefficients keyed by qubit-index vectors.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = hubo_aoa_state_superposition(
         p=p,
         quad=quad,
@@ -578,6 +728,23 @@ def _wrap_hubo_aoa_state_dicke(
     initial_ones: qmc.Vector[qmc.UInt],
     schedule_dicke: qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``hubo_aoa_state_dicke`` through the sampling path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        higher (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Higher-order cost coefficients keyed by qubit-index vectors.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        schedule_dicke (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Ordered SCS gate schedule for the Dicke preparation.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = hubo_aoa_state_dicke(
         p=p,
         quad=quad,
@@ -605,6 +772,22 @@ def _wrap_hubo_aoa_state_basis_state(
     pair_indices_mixer: qmc.Matrix[qmc.UInt],
     initial_ones: qmc.Vector[qmc.UInt],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``hubo_aoa_state_basis_state`` through the sampling path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        higher (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Higher-order cost coefficients keyed by qubit-index vectors.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = hubo_aoa_state_basis_state(
         p=p,
         quad=quad,
@@ -633,6 +816,24 @@ def _wrap_hubo_aoa_state_dicke_expval(
     schedule_dicke: qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``hubo_aoa_state_dicke`` through the expectation-value path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        higher (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Higher-order cost coefficients keyed by qubit-index vectors.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        schedule_dicke (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Ordered SCS gate schedule for the Dicke preparation.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = hubo_aoa_state_dicke(
         p=p,
         quad=quad,
@@ -661,6 +862,23 @@ def _wrap_hubo_aoa_state_basis_state_expval(
     initial_ones: qmc.Vector[qmc.UInt],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``hubo_aoa_state_basis_state`` through the expectation-value path.
+
+    Args:
+        p (qmc.UInt): Number of AOA layers.
+        quad (qmc.Dict[qmc.Tuple[qmc.UInt, qmc.UInt], qmc.Float]): Quadratic cost coefficients keyed by qubit-index pairs.
+        linear (qmc.Dict[qmc.UInt, qmc.Float]): Linear cost coefficients keyed by qubit index.
+        higher (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Higher-order cost coefficients keyed by qubit-index vectors.
+        n (qmc.UInt): Number of qubits in the register.
+        gammas (qmc.Vector[qmc.Float]): Cost-layer angles, one per layer.
+        betas (qmc.Vector[qmc.Float]): Mixer-layer angles, one per layer.
+        pair_indices_mixer (qmc.Matrix[qmc.UInt]): Qubit pairs ``(i, j)`` coupled by the XY mixer.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = hubo_aoa_state_basis_state(
         p=p,
         quad=quad,

@@ -19,13 +19,15 @@ from qamomile.optimization.schedules.dicke import dicke_state_composition_schedu
 # Backend registry
 # ---------------------------------------------------------------------------
 
-BACKENDS: list[tuple[str, type]] = []
+# Optional backends carry their pytest marker so the dedicated
+# ``-m quri_parts`` / ``-m cudaq`` runs select them and default runs skip them.
+BACKENDS: list = []
 try:
     import qiskit  # noqa: F401
 
     from qamomile.qiskit.transpiler import QiskitTranspiler
 
-    BACKENDS.append(("qiskit", QiskitTranspiler))
+    BACKENDS.append(pytest.param("qiskit", QiskitTranspiler, id="qiskit"))
 except ImportError:
     pass
 try:
@@ -33,7 +35,14 @@ try:
 
     from qamomile.quri_parts.transpiler import QuriPartsTranspiler
 
-    BACKENDS.append(("quri_parts", QuriPartsTranspiler))
+    BACKENDS.append(
+        pytest.param(
+            "quri_parts",
+            QuriPartsTranspiler,
+            marks=pytest.mark.quri_parts,
+            id="quri_parts",
+        )
+    )
 except ImportError:
     pass
 # cudaq imports ``torch`` at import time, whose OpenMP runtime segfaults
@@ -44,7 +53,9 @@ except ImportError:
 if importlib.util.find_spec("cudaq") is not None:
     from qamomile.cudaq.transpiler import CudaqTranspiler
 
-    BACKENDS.append(("cudaq", CudaqTranspiler))
+    BACKENDS.append(
+        pytest.param("cudaq", CudaqTranspiler, marks=pytest.mark.cudaq, id="cudaq")
+    )
 
 if not BACKENDS:
     pytest.skip("No quantum backend available", allow_module_level=True)
@@ -125,6 +136,17 @@ def _wrap_scs_gate_2q(
     c: qmc.UInt,
     theta: qmc.Float,
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``scs_gate_2q`` on an ``n``-qubit ``|0...0>`` register through the sampling path.
+
+    Args:
+        n (qmc.UInt): Number of qubits in the register.
+        t (qmc.UInt): Target qubit index.
+        c (qmc.UInt): Control qubit index.
+        theta (qmc.Float): SCS rotation angle.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = qmc.qubit_array(n, name="q")
     q = scs_gate_2q(q, t, c, theta)
     return qmc.measure(q)
@@ -138,6 +160,18 @@ def _wrap_scs_gate_3q(
     c2: qmc.UInt,
     theta: qmc.Float,
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``scs_gate_3q`` on an ``n``-qubit ``|0...0>`` register through the sampling path.
+
+    Args:
+        n (qmc.UInt): Number of qubits in the register.
+        t (qmc.UInt): Target qubit index.
+        c1 (qmc.UInt): First control qubit index.
+        c2 (qmc.UInt): Second control qubit index.
+        theta (qmc.Float): SCS rotation angle.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = qmc.qubit_array(n, name="q")
     q = scs_gate_3q(q, t, c1, c2, theta)
     return qmc.measure(q)
@@ -149,6 +183,16 @@ def _wrap_prepare_dicke(
     initial_ones: qmc.Vector[qmc.UInt],
     schedule: qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float],
 ) -> qmc.Vector[qmc.Bit]:
+    """Exercises ``prepare_dicke`` through the sampling path.
+
+    Args:
+        n (qmc.UInt): Number of qubits in the register.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        schedule (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Ordered SCS gate schedule for the Dicke preparation.
+
+    Returns:
+        qmc.Vector[qmc.Bit]: Measurement outcomes of the full register.
+    """
     q = prepare_dicke(n, initial_ones, schedule)
     return qmc.measure(q)
 
@@ -160,6 +204,17 @@ def _wrap_prepare_dicke_expval(
     schedule: qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float],
     hamiltonian: qmc.Observable,
 ) -> qmc.Float:
+    """Exercises ``prepare_dicke`` through the expectation-value path.
+
+    Args:
+        n (qmc.UInt): Number of qubits in the register.
+        initial_ones (qmc.Vector[qmc.UInt]): Indices of the qubits initialized to ``|1>``.
+        schedule (qmc.Dict[qmc.Vector[qmc.UInt], qmc.Float]): Ordered SCS gate schedule for the Dicke preparation.
+        hamiltonian (qmc.Observable): Observable whose expectation value is returned.
+
+    Returns:
+        qmc.Float: Expectation value of ``hamiltonian`` on the prepared state.
+    """
     q = prepare_dicke(n, initial_ones, schedule)
     return qmc.expval(q, hamiltonian)
 

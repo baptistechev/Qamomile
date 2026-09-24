@@ -6,13 +6,15 @@ import pytest
 from qamomile.optimization.aoa import AOAConverter
 from qamomile.optimization.binary_model import BinaryModel
 
-BACKENDS = []
+# Optional backends carry their pytest marker so the dedicated
+# ``-m quri_parts`` / ``-m cudaq`` runs select them and default runs skip them.
+BACKENDS: list = []
 try:
     import qiskit  # noqa: F401
 
     from qamomile.qiskit.transpiler import QiskitTranspiler
 
-    BACKENDS.append(("qiskit", QiskitTranspiler))
+    BACKENDS.append(pytest.param("qiskit", QiskitTranspiler, id="qiskit"))
 except ImportError:
     pass
 try:
@@ -20,7 +22,14 @@ try:
 
     from qamomile.quri_parts.transpiler import QuriPartsTranspiler
 
-    BACKENDS.append(("quri_parts", QuriPartsTranspiler))
+    BACKENDS.append(
+        pytest.param(
+            "quri_parts",
+            QuriPartsTranspiler,
+            marks=pytest.mark.quri_parts,
+            id="quri_parts",
+        )
+    )
 except ImportError:
     pass
 # cudaq imports ``torch`` at import time, whose OpenMP runtime segfaults
@@ -31,7 +40,9 @@ except ImportError:
 if importlib.util.find_spec("cudaq") is not None:
     from qamomile.cudaq.transpiler import CudaqTranspiler
 
-    BACKENDS.append(("cudaq", CudaqTranspiler))
+    BACKENDS.append(
+        pytest.param("cudaq", CudaqTranspiler, marks=pytest.mark.cudaq, id="cudaq")
+    )
 
 if not BACKENDS:
     pytest.skip("No quantum backend available", allow_module_level=True)
@@ -110,7 +121,7 @@ def test_invalid_initial_state_raises():
 
     with pytest.raises(ValueError, match="bogus"):
         converter.transpile(
-            BACKENDS[0][1](),
+            BACKENDS[0].values[1](),
             p=1,
             initial_state="bogus",  # type: ignore[arg-type]
         )
